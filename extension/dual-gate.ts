@@ -77,6 +77,16 @@ interface DgRuntime {
 }
 
 let runtime: DgRuntime | null = null;
+let piRef: ExtensionAPI | null = null;
+
+/** Show plain text to the user WITHOUT triggering a model turn (pure UI). */
+function showText(text: string): void {
+  try {
+    piRef?.sendMessage({ customType: "dual-gate", content: text, display: true });
+  } catch (e) {
+    console.error("[dual-gate] showText failed:", errMsg(e));
+  }
+}
 
 function getRuntime(): DgRuntime {
   if (!runtime) throw new Error("dual-gate runtime not initialized");
@@ -1382,7 +1392,7 @@ async function presentConverged(
   summary.push("", "Notes", "  Panel kept open for inspection (config: panel.on_complete). Run /dual cleanup to close done worker panels.");
 
   ctx.ui.notify("Dual-Gate ✓ CONVERGED", "success");
-  await ctx.sendUserMessage(summary.join("\n"));
+  showText(summary.join("\n"));
 }
 
 function readSpecRevisionLog(task: TaskRecord): Array<{ version: number; reason: string[] }> {
@@ -1420,7 +1430,7 @@ async function presentEscalation(ctx: ExtensionCommandContext, task: TaskRecord,
     "The DeepSeek worker pane is kept open for your inspection.",
   ];
   ctx.ui.notify("Dual-Gate: needs your decision", "warning");
-  await ctx.sendUserMessage(lines.join("\n"));
+  showText(lines.join("\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1428,6 +1438,7 @@ async function presentEscalation(ctx: ExtensionCommandContext, task: TaskRecord,
 // ---------------------------------------------------------------------------
 
 export default function dualGateExtension(pi: ExtensionAPI): void {
+  piRef = pi;
   runtime = {
     config: loadConfig(),
     manager: new TaskManager(process.cwd()),
@@ -1489,7 +1500,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
           const ctl = resolveModelString(rt.config.controller.model);
           const exe = resolveModelString(rt.config.executor.model);
           ctx.ui.notify("Dual-Gate enabled", "success");
-          await ctx.sendUserMessage(
+          showText(
             [
               "Dual-Gate enabled",
               `Controller  ${ctl?.id ?? "?"} · ${rt.config.controller.thinking}`,
@@ -1554,7 +1565,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
         }
         case "help":
         default: {
-          await ctx.sendUserMessage(
+          showText(
             [
               "Dual-Gate commands:",
               "  /dual on|off               enable / disable",
@@ -1611,7 +1622,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     } else {
       lines.push("DUAL-GATE OFF (normal Pi)");
     }
-    await ctx.sendUserMessage(lines.join("\n"));
+    showText(lines.join("\n"));
     updateWidget(ctx);
   }
 
@@ -1622,7 +1633,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     const reg = makeRegistry(ctx);
     const ctlValid = reg.find(config.controller.model) ? "✓" : "⚠";
     const exeValid = reg.find(config.executor.model) ? "✓" : "⚠";
-    await ctx.sendUserMessage(
+    showText(
       [
         "Dual-Gate Models",
         `Controller / Judge  ${ctl?.id ?? "?"} ${ctlValid}`,
