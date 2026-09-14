@@ -46,7 +46,7 @@ Controller 规划
 - Stage 2：Repo Memory 共享知识积累
 - Stage 3：并行里程碑（worktree + 多 pane）
 
-**状态**：阶段性规划；暂停/再分析/同 pane 再分派已在当前实现中提供。
+**状态**：项目模式现为三 pane：`/dual project <request>` 在 WBS 前创建持久、只读的 Product Manager Herdr pane；主 Pi 校验/展示 WBS 并取得显式确认，里程碑仍以稳定拓扑顺序复用 Executor → Gate → Judge。每个收敛里程碑会向同一 PM 写入有界完成交接；最终 PM 产品验收是 Controller ratification 的强制输入。PM 只允许 `read,grep,find,ls`，所有 IPC 和结果均由主 Pi 持久化于 `.pi/dual-gate/projects/`。PM 丢失仅可 L1 恢复一次，失败 fail closed；无跨重启 in-flight resume、作用域 Gate 或并行。`worktree.mode: isolated` 仍在项目入口被拒绝。
 
 ---
 

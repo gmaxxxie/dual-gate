@@ -2,7 +2,7 @@
 
 > **中文版** → [README.zh-CN.md](README.zh-CN.md) · Chinese version available here.
 
-A dual-model development workflow: **Astra (main Pi) acts as Controller/Judge**, **DeepSeek runs as Executor in a separate visible Herdr pane**, with a **Deterministic Gate** in between — the core is the **Expected ↔ Actual convergence loop**.
+A development workflow with a normal two-role task loop and an explicit **three-pane project mode**: **Astra (main Pi) remains Controller/Judge**, a persistent read-only **Product Manager** runs in its own visible Herdr pane, and **DeepSeek runs each milestone as Executor**. The Deterministic Gate remains between implementation and judgment.
 
 ```
 USER
@@ -89,18 +89,22 @@ Model IDs are **read from the current Pi registry**, never hardcoded. Defaults o
 | Controller / Judge | `openai-codex/gpt-5.6-sol` | GPT-5.6 Sol, via ChatGPT subscription backend (`opencode/*` has no auth, unusable) |
 | Controller thinking | `medium` | model supports mapping to medium |
 | Executor | `new-api/deepseek-v4-flash` | DeepSeek V4 Flash (local gateway, has auth) |
+| Product Manager | `default` | Project-only, follows the parent Pi model; read-only Herdr pane |
 
-Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual thinking [level]`.
+Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual product-manager [id|default]`, `/dual thinking [level]`.
 
 ## Commands
 
 | Command | Effect |
 |---|---|
 | `/dual on` / `/dual off` | Enable/disable. OFF fully restores normal Pi |
-| `/dual status` | Status: models, Herdr, Task, State, Iteration, Spec version, Pane, Session alive |
+| `/dual status` | Status: models, Herdr, Task, State, Iteration, Spec version, Pane, Session alive, and active project progress |
+| `/dual project <request>` | Create a project WBS, show it for explicit approval, then execute dependency-ordered milestones serially |
+| `/dual project status` | Show active project milestone/final-acceptance progress |
 | `/dual models` | View current model config |
 | `/dual controller [id]` | Choose Controller/Judge model (no arg opens a selector) |
 | `/dual executor [id]` | Choose Executor model (no arg opens a selector) |
+| `/dual product-manager [id\|default]` | Choose the project-only read-only PM model |
 | `/dual thinking [level]` | thinking: minimal/low/medium/high/xhigh/max |
 | `/dual cancel` | Cancel current task: stop orchestration, keep the pane (renamed `· CANCELLED`), don't delete code or reset git |
 | `/dual bypass` | Next user task goes through normal Pi, then Dual-Gate resumes |
@@ -113,6 +117,7 @@ Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual thinking 
   "enabled": false,   // off by default; persisted to true after /dual on
   "controller": { "model": "openai-codex/gpt-5.6-sol", "thinking": "medium" },
   "executor": { "model": "new-api/deepseek-v4-flash" },
+  "product_manager": { "model": "default" },
   "runtime": { "herdr": "required" },
   "gate": { "enabled": true, "max_retries": 3, "timeoutMs": 300000 },
   "judge": { "max_retries": 2 },
@@ -123,6 +128,12 @@ Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual thinking 
   "ui": { "show_widget": true }
 }
 ```
+
+## Project mode (three panes)
+
+`/dual project <request>` is explicit: ordinary prompts remain unchanged. Project mode creates a persistent visible **PM** Herdr pane before WBS generation, alongside the main Controller/Judge pane and the current milestone Executor pane. The PM is read-only (`read,grep,find,ls`; no shell or write tools) and produces its WBS only through durable project artifacts. Main Pi validates and presents that WBS for explicit user approval, then remains sole owner of milestone contracts, task planning/control, Gate, Judge, persistence, and cancellation.
+
+Each milestone still uses the unchanged Executor → Gate → Judge loop. Once its persisted task has converged, Main sends the same PM a bounded durable completion handoff. A PM `blocked` handoff stops the project; malformed, timeout, or lost-PM failures fail closed. After all milestones, Main runs the final Gate, obtains mandatory PM product acceptance, then independently asks the Controller for ratification. `ACCEPTED` requires clear PM acceptance, clear Controller ratification, a final Gate pass, and every milestone converged with no unresolved items. PM panes remain for inspection unless `panel.on_complete` is `close` or `/dual cleanup` is run.
 
 ## Artifacts (per task)
 
@@ -144,6 +155,25 @@ Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual thinking 
 ```
 
 Model private CoT is never saved; only Expected / Actual / Delta / Gate / State.
+
+## Project artifacts
+
+```
+.pi/dual-gate/projects/<project-id>/
+├── project-plan.yaml
+├── project-state.json / project-approval.json
+├── product-manager/
+│   ├── metadata.json / plan-request.json / plan-response-raw.md
+│   ├── milestone-<M>-request.json / milestone-<M>-feedback.yaml
+│   └── final-acceptance-request.json / product-acceptance.yaml
+├── controller-ratification.yaml
+├── milestones/<M-id>/milestone.yaml
+├── milestones/<M-id>/state.json / task-ref.json
+├── final-gate-discovery.json / final-gate.log
+└── project-acceptance-report.md (PM input + Controller ratification)
+```
+
+Milestone task artifacts remain in their normal `.pi/dual-gate/<task-id>/` directories; `task-ref.json` links them without changing recovery or worktree behavior.
 
 ## State Machine
 

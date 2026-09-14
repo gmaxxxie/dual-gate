@@ -23,6 +23,13 @@ import type {
   SpecRevision,
   SpecRevisionResult,
   ConvergenceDiagnosis,
+  ProjectPlan,
+  Milestone,
+  ProjectMilestoneContext,
+  ProjectAcceptance,
+  ProjectRecord,
+  ProjectState,
+  ProjectMilestoneFeedback,
 } from "./types.ts";
 
 export interface ArtifactStore {
@@ -58,6 +65,8 @@ export const DEFAULT_CONFIG: DgConfig = {
   enabled: false,
   controller: { model: "openai-codex/gpt-5.6-sol", thinking: "medium" },
   executor: { model: "new-api/deepseek-v4-flash" },
+  // Project mode only. `default` deliberately follows the parent Pi model.
+  product_manager: { model: "default" },
   runtime: { herdr: "required" },
   gate: { enabled: true, max_retries: 3, timeoutMs: 300_000 },
   judge: { max_retries: 2 },
@@ -79,6 +88,10 @@ export function normalizeConfig(raw: Partial<DgConfig> | null | undefined): DgCo
   }
   if (r.executor && typeof r.executor === "object") {
     if (typeof r.executor.model === "string" && r.executor.model.trim()) c.executor.model = r.executor.model.trim();
+  }
+  // Optional for backwards-compatible persisted configuration.
+  if (r.product_manager && typeof r.product_manager === "object") {
+    if (typeof r.product_manager.model === "string" && r.product_manager.model.trim()) c.product_manager.model = r.product_manager.model.trim();
   }
   if (r.gate && typeof r.gate === "object") {
     if (typeof r.gate.enabled === "boolean") c.gate.enabled = r.gate.enabled;
@@ -133,6 +146,22 @@ export interface ModelRegistryAdapter {
   hasAuth(modelRef: ModelRef): boolean;
 }
 
+/**
+ * Resolve a model only from the authenticated models actually exposed by Pi.
+ * Unlike registry.find(), this deliberately never accepts a synthetic model
+ * reference for a qualified but unknown provider/model pair.
+ */
+export function findAvailableAuthenticatedModel(registry: ModelRegistryAdapter, spec: string): ModelRef | null {
+  const requested = resolveModelString(spec);
+  if (!requested) return null;
+  const matches = registry.available().filter((model) => {
+    if (requested.provider) return model.provider === requested.provider && model.id === requested.id;
+    return model.id === requested.id || model.name.toLowerCase() === requested.name.toLowerCase();
+  });
+  const model = matches[0];
+  return model && registry.hasAuth(model) ? model : null;
+}
+
 // ---------------------------------------------------------------------------
 // Task ID and artifact layout
 // ---------------------------------------------------------------------------
@@ -151,6 +180,21 @@ export function artifactRoot(cwd: string): string {
 
 export function taskDirFor(cwd: string, taskId: string): string {
   return join(artifactRoot(cwd), taskId);
+}
+
+export function generateProjectId(now = new Date()): string {
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `project-${y}${m}${d}-${randomBytes(3).toString("hex").slice(0, 4)}`;
+}
+
+export function projectDirFor(cwd: string, projectId: string): string {
+  return join(artifactRoot(cwd), "projects", projectId);
+}
+
+export function projectMilestoneDirFor(cwd: string, projectId: string, milestoneId: string): string {
+  return join(projectDirFor(cwd, projectId), "milestones", milestoneId);
 }
 
 export function normalizeRepoPath(cwd: string): string {
@@ -341,6 +385,15 @@ export function trackConvergence(task: TaskRecord, newGapCount: number, sameGap:
 // Prompt building
 // ---------------------------------------------------------------------------
 
+export function formatProjectContext(context?: ProjectMilestoneContext): string {
+  if (!context) return "";
+  const scope = [...context.scope.files, ...context.scope.components].join(", ") || "(none)";
+  const prior = context.completedSummaries.length
+    ? context.completedSummaries.map((x) => `- ${x.milestoneId} (${x.verdict}): ${x.summary}`).join("\n")
+    : "- none";
+  return `\n## PROJECT / MILESTONE CONTEXT (authoritative boundary)\nPROJECT: ${context.projectId} — ${context.projectGoal}\nMILESTONE: ${context.milestoneId} — ${context.milestoneTitle}\nDEPENDENCIES: ${context.dependsOn.join(", ") || "none"}\nSCOPE: ${scope}\nCOMPLETED MILESTONES:\n${prior}\nDo not regress completed milestones or work outside this milestone scope.`;
+}
+
 export function buildExecutorPrompt(input: {
   originalRequest: string;
   contract: AcceptanceContract;
@@ -352,6 +405,7 @@ export function buildExecutorPrompt(input: {
   panelTitle: string;
   /** Controller-owned location, which may be outside an isolated worktree. */
   artifactDir?: string;
+  projectContext?: ProjectMilestoneContext;
 }): string {
   const c = input.contract;
   const criteriaLines = c.acceptance_criteria.map((x, i) => `  ${i + 1}. ${x}`).join("\n");
@@ -366,12 +420,14 @@ export function buildExecutorPrompt(input: {
     ? join(input.artifactDir, "executor-report.yaml")
     : join(input.repoPath, ".pi", "dual-gate", input.taskId, "executor-report.yaml");
 
+  const projectContext = formatProjectContext(input.projectContext);
   let body = "";
   if (input.mode === "initial") {
     body = `You are the Executor in a Dual-Gate workflow. You own implementation, debugging and validation in the repository.
 
 REPOSITORY: ${input.repoPath}
 TASK ID: ${input.taskId}
+${projectContext}
 
 ## ORIGINAL USER REQUEST
 ${input.originalRequest}
@@ -545,7 +601,7 @@ Fix the gaps, rerun validation, and produce an updated Execution Report (fenced 
   }
 
   if (input.mode !== "initial") {
-    body += `\n\nBefore sending the final report, also write the same YAML to:\n${durableReportPath}`;
+    body += `\n\n${projectContext}\n\nBefore sending the final report, also write the same YAML to:\n${durableReportPath}`;
   }
   return body.trim();
 }
@@ -561,6 +617,7 @@ export function buildJudgePrompt(input: {
   iteration: number;
   previousJudge?: JudgeOutput;
   expectedVersion: number;
+  projectContext?: ProjectMilestoneContext;
 }): string {
   const prev = input.previousJudge
     ? `\n## PREVIOUS COMPARISON (for convergence tracking)\n${JSON.stringify(
@@ -575,6 +632,7 @@ TASK ID: ${input.taskId}
 RISK LEVEL: ${input.risk}
 ITERATION: ${input.iteration}
 EXPECTED OUTCOME VERSION: v${input.expectedVersion}
+${formatProjectContext(input.projectContext)}
 
 ## ORIGINAL USER REQUEST
 ${input.originalRequest}
@@ -647,6 +705,7 @@ export function buildSpecRevisionPrompt(input: {
   judge: JudgeOutput;
   actualReport: unknown;
   repoPath: string;
+  projectContext?: ProjectMilestoneContext;
 }): string {
   return `You are the Controller/Architect of a Dual-Gate workflow. The Judge found the Expected Outcome does not match repository reality, so you must REVISE the Expected Outcome.
 
@@ -654,6 +713,7 @@ ORIGINAL USER REQUEST:
 ${input.originalRequest}
 
 REPOSITORY: ${input.repoPath}
+${formatProjectContext(input.projectContext)}
 
 CURRENT EXPECTED OUTCOME (v${input.contract.version}):
 ${JSON.stringify(input.contract, null, 2)}
@@ -746,6 +806,7 @@ export function buildSpecUpdatePrompt(input: {
   originalRequest: string;
   repoPath: string;
   taskId: string;
+  projectContext?: ProjectMilestoneContext;
 }): string {
   const c = input.contract;
   const criteriaLines = c.acceptance_criteria.map((x, i) => `  ${i + 1}. ${x}`).join("\n");
@@ -757,6 +818,7 @@ Current Expected Version: v${c.version}
 
 TASK ID: ${input.taskId}
 REPOSITORY: ${input.repoPath}
+${formatProjectContext(input.projectContext)}
 
 ## CHANGED
 ${lines(input.revision.changed)}
@@ -802,6 +864,7 @@ export function buildExecutorCheckpoint(input: {
   delta: Delta | null;
   gateSummary: string;
   lastVerdict?: string;
+  projectContext?: ProjectMilestoneContext;
 }): string {
   const c = input.contract;
   const files = Array.isArray(input.report.files_changed)
@@ -813,6 +876,7 @@ export function buildExecutorCheckpoint(input: {
   id: ${input.taskId}
   original_request: ${input.originalRequest.replace(/\n/g, " ")}
 current_expected_version: ${input.expectedVersion}
+project_context: ${input.projectContext ? `${input.projectContext.projectId}/${input.projectContext.milestoneId}` : "none"}
 goal: ${c.goal}
 acceptance_criteria:
 ${c.acceptance_criteria.map((x) => `  - ${x}`).join("\n")}
@@ -848,6 +912,7 @@ export function buildRecoveryPrompt(input: {
   checkpoint: string;
   repoPath: string;
   delta: Delta | null;
+  projectContext?: ProjectMilestoneContext;
 }): string {
   const c = input.contract;
   const criteriaLines = c.acceptance_criteria.map((x, i) => `  ${i + 1}. ${x}`).join("\n");
@@ -857,6 +922,7 @@ export function buildRecoveryPrompt(input: {
 
 TASK ID: ${input.taskId}
 REPOSITORY: ${input.repoPath}
+${formatProjectContext(input.projectContext)}
 
 ## ORIGINAL USER REQUEST
 ${input.originalRequest}
@@ -1149,6 +1215,163 @@ export function parseContractYaml(text: string, originalRequest: string, version
     validation: { required: arr(parsed?.validation?.required ?? parsed?.validation) },
     risk: { level: riskLevel, concerns: arr(parsed?.risk?.concerns) },
   };
+}
+
+export function buildProjectPlanPrompt(input: { sourceRequest: string; repoPath: string }): string {
+  return `You are the Controller/Architect planning a multi-milestone project. Do not implement code. Produce ONLY a fenced YAML Project Plan for explicit user approval.\n\nREPOSITORY: ${input.repoPath}\nREQUEST: ${input.sourceRequest}\n\nThe plan must decompose the work into a serial dependency-ordered WBS. Every milestone needs a stable id, title, depends_on, nonempty scope.files or scope.components, expected_outcome, acceptance_criteria, validation.required, and risk. Project-level acceptance_criteria and validation.required are mandatory. Do not include reasoning.\n\n\`\`\`yaml\ngoal: ...\ncontext: ...\nconstraints:\n  - ...\nacceptance_criteria:\n  - ...\nvalidation:\n  required:\n    - ...\nmilestones:\n  - id: M1\n    title: ...\n    depends_on: []\n    scope:\n      files:\n        - ...\n      components:\n        - ...\n    expected_outcome:\n      - ...\n    acceptance_criteria:\n      - ...\n    validation:\n      required:\n        - ...\n    risk:\n      level: low|medium|high\n      concerns:\n        - ...\`\`\``;
+}
+
+function projectString(v: unknown): string { return typeof v === "string" ? v.trim() : v == null ? "" : String(v).trim(); }
+function projectStrings(v: unknown): string[] {
+  if (Array.isArray(v)) return v.map(projectString).filter(Boolean);
+  if (typeof v !== "string" || !v.trim()) return [];
+  const text = v.trim();
+  if (/^\[[\s\S]*\]$/.test(text)) return text.slice(1, -1).split(",").map(projectString).filter(Boolean);
+  return [text];
+}
+function projectRisk(v: unknown): "low" | "medium" | "high" { return v === "medium" || v === "high" ? v : "low"; }
+
+export function validateProjectPlan(plan: ProjectPlan): string[] {
+  const errors: string[] = [];
+  if (!plan.goal.trim()) errors.push("project goal is required");
+  if (!plan.acceptance_criteria.length) errors.push("project acceptance_criteria is required");
+  if (!plan.validation.required.length) errors.push("project validation.required is required");
+  if (!plan.milestones.length) errors.push("at least one milestone is required");
+  const ids = new Set<string>();
+  for (const m of plan.milestones) {
+    if (!/^[A-Za-z0-9._-]+$/.test(m.id)) errors.push(`invalid milestone id: ${m.id || "(empty)"}`);
+    if (ids.has(m.id)) errors.push(`duplicate milestone id: ${m.id}`);
+    ids.add(m.id);
+    if (!m.title.trim()) errors.push(`milestone ${m.id}: title is required`);
+    if (!m.scope.files.length && !m.scope.components.length) errors.push(`milestone ${m.id}: scope is required`);
+    if (!m.expected_outcome.length) errors.push(`milestone ${m.id}: expected_outcome is required`);
+    if (!m.acceptance_criteria.length) errors.push(`milestone ${m.id}: acceptance_criteria is required`);
+    if (!m.validation.required.length) errors.push(`milestone ${m.id}: validation.required is required`);
+    for (const dep of m.depends_on) {
+      if (dep === m.id) errors.push(`milestone ${m.id}: cannot depend on itself`);
+      else if (!ids.has(dep) && !plan.milestones.some((candidate) => candidate.id === dep)) errors.push(`milestone ${m.id}: unknown dependency ${dep}`);
+    }
+  }
+  if (!errors.length) {
+    try { topologicallyOrderMilestones(plan.milestones); } catch (e) { errors.push(errString(e)); }
+  }
+  return errors;
+}
+
+function errString(e: unknown): string { return e instanceof Error ? e.message : String(e); }
+
+export function parseProjectPlan(text: string): ProjectPlan {
+  const block = extractYamlBlock(text);
+  // PM IPC wraps the unchanged plan schema in correlation metadata; the plan
+  // validator deliberately consumes the original schema, not a second schema.
+  const yaml = (block ?? text).replace(/^(?:protocol_version|request_id|kind):[^\n]*\n/gm, "");
+  const raw = parseTolerantYaml(yaml);
+  if (!raw) throw new Error("Project plan is not valid YAML");
+  const milestonesRaw = Array.isArray(raw.milestones) ? raw.milestones : [];
+  const milestones: Milestone[] = milestonesRaw.map((value) => {
+    const m = value && typeof value === "object" ? value as Record<string, unknown> : {};
+    const scope = m.scope && typeof m.scope === "object" ? m.scope as Record<string, unknown> : {};
+    const validation = m.validation && typeof m.validation === "object" ? m.validation as Record<string, unknown> : {};
+    const risk = m.risk && typeof m.risk === "object" ? m.risk as Record<string, unknown> : {};
+    return { id: projectString(m.id), title: projectString(m.title), depends_on: projectStrings(m.depends_on), scope: { files: projectStrings(scope.files), components: projectStrings(scope.components) }, expected_outcome: projectStrings(m.expected_outcome), acceptance_criteria: projectStrings(m.acceptance_criteria), validation: { required: projectStrings(validation.required ?? m.validation) }, risk: { level: projectRisk(risk.level), concerns: projectStrings(risk.concerns) } };
+  });
+  const validation = raw.validation && typeof raw.validation === "object" ? raw.validation as Record<string, unknown> : {};
+  const plan: ProjectPlan = { version: typeof raw.version === "number" ? raw.version : 1, goal: projectString(raw.goal), context: projectString(raw.context), constraints: projectStrings(raw.constraints), acceptance_criteria: projectStrings(raw.acceptance_criteria), validation: { required: projectStrings(validation.required ?? raw.validation) }, milestones };
+  const errors = validateProjectPlan(plan);
+  if (errors.length) throw new Error(`Invalid project plan: ${errors.join("; ")}`);
+  return plan;
+}
+
+/** Kahn ordering that preserves source/WBS order among independently eligible milestones. */
+export function topologicallyOrderMilestones(milestones: Milestone[]): Milestone[] {
+  const byId = new Map(milestones.map((m) => [m.id, m]));
+  const remaining = new Map(milestones.map((m) => [m.id, new Set(m.depends_on)]));
+  const ordered: Milestone[] = [];
+  while (remaining.size) {
+    const next = milestones.find((m) => remaining.has(m.id) && [...(remaining.get(m.id) ?? [])].every((dep) => !remaining.has(dep)));
+    if (!next) throw new Error("milestone dependency cycle detected");
+    ordered.push(next);
+    remaining.delete(next.id);
+  }
+  return ordered;
+}
+
+export function milestoneToAcceptanceContract(plan: ProjectPlan, milestone: Milestone, sourceRequest: string): AcceptanceContract {
+  return { version: 1, task: { original_request: sourceRequest }, goal: milestone.title, context: [plan.context, `Project goal: ${plan.goal}`, `Milestone scope: ${[...milestone.scope.files, ...milestone.scope.components].join(", ")}`].filter(Boolean).join("\n"), architecture: { relevant_components: [...milestone.scope.files, ...milestone.scope.components] }, constraints: [...plan.constraints, `Stay within milestone ${milestone.id} scope and preserve dependencies: ${milestone.depends_on.join(", ") || "none"}.`], expected_outcome: milestone.expected_outcome, acceptance_criteria: milestone.acceptance_criteria, validation: { required: milestone.validation.required }, risk: milestone.risk };
+}
+
+/** Read-only PM process arguments. Exported here to keep launch policy unit-testable. */
+export function productManagerPiArgs(model: string): string[] {
+  const args = ["--no-extensions", "--tools", "read,grep,find,ls"];
+  if (model && model !== "default") args.unshift("--model", model);
+  return args;
+}
+
+/** Select the latest validated fenced response correlated with this IPC request. */
+export function extractCorrelatedYamlBlock(text: string, requestId: string, expectedKind?: "plan" | "milestone_feedback" | "final_acceptance"): string | null {
+  const fence = /```(?:ya?ml)?\s*\n([\s\S]*?)\n```/gi;
+  let latest: string | null = null;
+  for (const match of text.matchAll(fence)) {
+    const parsed = parseTolerantYaml(match[1]);
+    if (parsed && parsed.protocol_version === 1 && parsed.request_id === requestId && (!expectedKind || parsed.kind === expectedKind)) latest = match[1];
+  }
+  return latest;
+}
+
+export function buildProductManagerPlanPrompt(input: { sourceRequest: string; repoPath: string; requestId: string }): string {
+  return `You are the read-only Product Manager for a Dual-Gate project. Produce a WBS only; never implement, edit, create, delete, or propose direct source edits. Your response is captured by the main Pi, which is the only writer of durable artifacts. Do not use any write-capable action.\n\nREPOSITORY: ${input.repoPath}\nREQUEST: ${input.sourceRequest}\n\nReturn ONLY one fenced YAML response. It MUST include protocol_version: 1, request_id: ${input.requestId}, kind: plan, followed by the complete Project Plan schema below. Every milestone must be dependency ordered and scoped.\n\n\`\`\`yaml\nprotocol_version: 1\nrequest_id: <the request_id above>\nkind: plan\ngoal: ...\ncontext: ...\nconstraints: [...]\nacceptance_criteria: [...]\nvalidation: { required: [...] }\nmilestones: [...]\n\`\`\``;
+}
+
+export function buildMilestoneCompletionFeedbackPrompt(input: ProjectMilestoneFeedback): string {
+  return `You are the read-only Product Manager. Record the product consequence of this completed milestone; do not edit source files or write artifacts. The main Pi persists this transcript. REQUEST ID: ${input.request_id}. Return ONLY the correlated fenced YAML response.\n\nCOMPLETION HANDOFF:\n${JSON.stringify(input, null, 2)}\n\n\`\`\`yaml\nprotocol_version: 1\nrequest_id: <the request_id above>\nkind: milestone_feedback\nmilestone_id: <the milestone_id from the handoff>\ntask_id: <the task_id from the handoff>\ndecision: acknowledged|blocked\nsummary: ...\nunresolved: []\ndeviations: []\nreason: ...\n\`\`\``;
+}
+
+export function buildProductAcceptancePrompt(input: { requestId: string; plan: ProjectPlan; milestones: unknown[]; diff: string; gateSummary: string }): string {
+  return `You are the read-only Product Manager issuing the mandatory product-level acceptance input. Do not edit source files or write artifacts. Verify the approved WBS, all durable milestone outcomes, final gate, and aggregate diff. REQUEST ID: ${input.requestId}. Return ONLY the correlated fenced YAML response.\n\nPROJECT PLAN:\n${JSON.stringify(input.plan, null, 2)}\n\nMILESTONES:\n${JSON.stringify(input.milestones, null, 2)}\n\nFINAL GATE:\n${input.gateSummary}\n\nAGGREGATE DIFF:\n${input.diff.slice(0, 30000)}\n\n\`\`\`yaml\nprotocol_version: 1\nrequest_id: <the request_id above>\nkind: final_acceptance\nverdict: accepted|gaps|blocked\nsummary: ...\nsatisfied: []\ngaps: []\nunresolved: []\nreason: ...\n\`\`\``;
+}
+
+export function buildProductManagerRecoveryPrompt(input: { projectId: string; requestId: string; outstandingRequest: unknown; persistedPlan?: unknown; persistedFeedback?: unknown[] }): string {
+  return `You are a recovered read-only Product Manager for project ${input.projectId}. Do not edit source files and do not write any artifact; the main Pi owns persistence. Reissue exactly one response for the outstanding request ID ${input.requestId}; do not invent a new request ID.\n\nPERSISTED PLAN:\n${JSON.stringify(input.persistedPlan ?? null, null, 2)}\n\nPERSISTED FEEDBACK:\n${JSON.stringify(input.persistedFeedback ?? [], null, 2)}\n\nOUTSTANDING REQUEST:\n${JSON.stringify(input.outstandingRequest, null, 2)}`;
+}
+
+export function parseProductMilestoneFeedback(text: string, requestId: string): ProjectMilestoneFeedback | null {
+  const block = extractCorrelatedYamlBlock(text, requestId);
+  const raw = block ? parseTolerantYaml(block) : null;
+  if (!raw || raw.kind !== "milestone_feedback" || raw.protocol_version !== 1 || raw.request_id !== requestId) return null;
+  if (raw.decision !== "acknowledged" && raw.decision !== "blocked") return null;
+  const milestone_id = projectString(raw.milestone_id);
+  const task_id = projectString(raw.task_id);
+  const summary = projectString(raw.summary);
+  const reason = projectString(raw.reason);
+  if (!milestone_id || !task_id || !summary || !reason || !Array.isArray(raw.unresolved) || !Array.isArray(raw.deviations)) return null;
+  return { protocol_version: 1, request_id: requestId, kind: "milestone_feedback", milestone_id, task_id, executor_summary: "", judge: { verdict: "converged", gaps: [] }, gate_summary: "", unresolved: projectStrings(raw.unresolved), deviations: projectStrings(raw.deviations), decision: raw.decision, summary, reason };
+}
+
+export function buildProjectAcceptancePrompt(input: { plan: ProjectPlan; milestones: Array<{ milestoneId: string; title: string; summary: string; verdict: string; unresolved: string[]; deviations: string[] }>; diff: string; gateSummary: string; productAcceptance: ProjectAcceptance }): string {
+  return `You are the Controller performing final ratification, not product acceptance. The Product Manager verdict below is authoritative product input. NEVER return accepted when it is gaps or blocked, or it contains gaps/unresolved. Independently enforce the final Gate and every milestone's convergence; PM acceptance alone never bypasses Controller, Gate, or Judge. Output ONLY fenced YAML.\n\nPRODUCT MANAGER ACCEPTANCE:\n${JSON.stringify(input.productAcceptance, null, 2)}\n\nPROJECT PLAN:\n${JSON.stringify(input.plan, null, 2)}\n\nMILESTONE RESULTS:\n${JSON.stringify(input.milestones, null, 2)}\n\nFINAL GATE:\n${input.gateSummary}\n\nAGGREGATE DIFF:\n${input.diff.slice(0, 30000)}\n\n\`\`\`yaml\nverdict: accepted|gaps|blocked\nsummary: ...\nsatisfied:\n  - ...\ngaps:\n  - ...\nunresolved:\n  - ...\nreason: ...\n\`\`\``;
+}
+
+export function parseProjectAcceptance(text: string, requestId?: string): ProjectAcceptance | null {
+  const block = requestId ? extractCorrelatedYamlBlock(text, requestId) : extractYamlBlock(text);
+  const raw = parseTolerantYaml(block ?? text);
+  if (!raw || (requestId && (raw.protocol_version !== 1 || raw.request_id !== requestId || raw.kind !== "final_acceptance")) || (raw.verdict !== "accepted" && raw.verdict !== "gaps" && raw.verdict !== "blocked")) return null;
+  const summary = projectString(raw.summary);
+  const reason = projectString(raw.reason);
+  if (!summary || !reason || !Array.isArray(raw.satisfied) || !Array.isArray(raw.gaps) || !Array.isArray(raw.unresolved)) return null;
+  return { verdict: raw.verdict, summary, satisfied: projectStrings(raw.satisfied), gaps: projectStrings(raw.gaps), unresolved: projectStrings(raw.unresolved), reason };
+}
+
+export function isActiveProjectState(status: ProjectState): boolean {
+  return status === "PLANNING" || status === "AWAITING_APPROVAL" || status === "RUNNING" || status === "ACCEPTING";
+}
+
+export function isProjectFinalizationStopped(status: ProjectState, stopRequested: boolean): boolean {
+  return status === "CANCELLED" || stopRequested;
+}
+
+export function canAcceptProject(input: { orderedMilestoneIds: string[]; milestones: ProjectRecord["milestones"]; finalGatePassed: boolean; productAcceptance: ProjectAcceptance | null; acceptance: ProjectAcceptance | null }): boolean {
+  const acceptedAndClear = (value: ProjectAcceptance | null) => !!value && value.verdict === "accepted" && !value.gaps.length && !value.unresolved.length;
+  return acceptedAndClear(input.productAcceptance) && acceptedAndClear(input.acceptance) && input.finalGatePassed && input.orderedMilestoneIds.every((id) => { const m = input.milestones[id]; return m?.status === "CONVERGED" && m.verdict === "converged" && !(m.unresolved?.length); });
 }
 
 export function parseConvergenceDiagnosis(text: string): ConvergenceDiagnosis | null {

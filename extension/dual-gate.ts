@@ -32,7 +32,27 @@ import {
   normalizeConfig,
   isThinking,
   resolveModelString,
+  findAvailableAuthenticatedModel,
   taskDirFor,
+  projectDirFor,
+  projectMilestoneDirFor,
+  generateProjectId,
+  createArtifactStore,
+  buildProductManagerPlanPrompt,
+  buildMilestoneCompletionFeedbackPrompt,
+  buildProductAcceptancePrompt,
+  buildProductManagerRecoveryPrompt,
+  parseProductMilestoneFeedback,
+  extractCorrelatedYamlBlock,
+  productManagerPiArgs as buildProductManagerPiArgs,
+  parseProjectPlan,
+  topologicallyOrderMilestones,
+  milestoneToAcceptanceContract,
+  buildProjectAcceptancePrompt,
+  parseProjectAcceptance,
+  isActiveProjectState,
+  isProjectFinalizationStopped,
+  canAcceptProject,
   normalizeRepoPath,
   derivePanelTitle,
   deriveAgentName,
@@ -62,6 +82,7 @@ import {
   type SpecRevision,
   type ConvergenceDiagnosis,
 } from "./core.ts";
+import type { ProjectPlan, ProjectRecord, ProjectMilestoneContext, ProductManagerRecord, ProjectMilestoneFeedback } from "./types.ts";
 import { discoverGateCommands, runGate, formatGateResult, skippedGateResult, type GateResult } from "./gate.ts";
 
 // ---------------------------------------------------------------------------
@@ -87,6 +108,7 @@ interface DgRuntime {
   /** A separate flag keeps an argument-less resume distinct from no resume. */
   resumeRequested: boolean;
   pendingResumeRequirement: string | undefined;
+  activeProject: ProjectRecord | null;
 }
 
 let runtime: DgRuntime | null = null;
@@ -390,6 +412,19 @@ async function herdrPaneExists(paneId: string): Promise<boolean> {
   return code === 0;
 }
 
+function deriveProductManagerName(projectId: string): string {
+  return `pm-${projectId.replace(/[^a-z0-9_-]/gi, "").slice(-24).toLowerCase()}`;
+}
+
+function deriveProductManagerTitle(projectId: string, repoPath: string): string {
+  return `PM · ${basename(repoPath)} · ${projectId}`;
+}
+
+/** PM deliberately gets only read-only Pi tools; all artifact writes stay in Main Pi. */
+function productManagerPiArgs(model: string): string[] {
+  return buildProductManagerPiArgs(model);
+}
+
 function executorPiArgs(model: string): string[] {
   // Keep all user extensions disabled to prevent recursive Dual-Gate tasks,
   // but explicitly retain Herdr's Pi state reporter so worker lifecycle can
@@ -585,7 +620,9 @@ function updateWidget(ctx: ExtensionContext): void {
       return;
     }
     if (!task) {
-      ctx.ui.setWidget("dual-gate", [ctx.ui.theme.fg("muted", "dual-gate: idle")]);
+      const project = rt.activeProject;
+      const pm = project?.productManager;
+      ctx.ui.setWidget("dual-gate", [ctx.ui.theme.fg("muted", project ? `dual-gate project · ${project.status} · PM ${pm?.state ?? "none"}${pm?.paneId ? ` · ${pm.paneId}` : ""}` : "dual-gate: idle")]);
       return;
     }
     const s = stateOf(task);
@@ -822,7 +859,7 @@ function presentPlanningSummary(task: TaskRecord, contract: AcceptanceContract, 
 // The closed-loop orchestration
 // ---------------------------------------------------------------------------
 
-async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Promise<void> {
+async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, options: { initialContract?: AcceptanceContract; projectContext?: ProjectMilestoneContext } = {}): Promise<void> {
   const rt = getRuntime();
   const config = rt.config;
   const store = makeStore(task);
@@ -834,7 +871,15 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
     rt.manager.patch(task.taskId, { state: "PLANNING", currentStage: "planning" });
     writeMetadata(task, store);
     writeState(task, store);
-    let contract = await plan(ctx, task, config, store);
+    let contract: AcceptanceContract;
+    if (options.initialContract) {
+      contract = options.initialContract;
+      store.write("task.md", `# Task ${task.taskId}\n\n## Original Request\n${task.originalRequest}\n`);
+      writeSpecVersioned(store, contract.version, contract);
+      presentPlanningSummary(task, contract, "project plan");
+    } else {
+      contract = await plan(ctx, task, config, store);
+    }
     if (taskStopped(task)) return;
     // Model-produced risk can add detail, but cannot downgrade deterministic
     // risk derived from the user's original request.
@@ -907,7 +952,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
           spec_changes: ["Merge new requirement"],
           delta: { matched: [], missing: [], incorrect: [], unexpected: [], required_changes: [], must_preserve: [] },
           reason: "User requested a change during execution.",
-        }, report, store);
+        }, report, store, options.projectContext);
         if (revised) {
           contract = revised.contract;
           rt.manager.patch(task.taskId, { expectedVersion: contract.version, specRevisions: (task.specRevisions ?? 0) + 1 });
@@ -917,7 +962,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
 
       // ---- Spawn executor (only on first iteration or spec revision) ----
       if (!executorActive) {
-        await spawnExecutor(ctx, task, config);
+        await spawnExecutor(ctx, task, config, options.projectContext);
         if (taskStopped(task) || task.state !== "EXECUTING") return; // stopped or spawn failed
         executorActive = true;
       }
@@ -939,7 +984,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
             gaps: ["New requirement from user: " + pause.newRequirement], implementation_changes: [], spec_changes: ["Merge new requirement"],
             delta: { matched: [], missing: [], incorrect: [], unexpected: [], required_changes: [], must_preserve: [] },
             reason: "User requested a change during execution.",
-          }, report, store);
+          }, report, store, options.projectContext);
           if (revised) {
             contract = revised.contract;
             rt.manager.patch(task.taskId, { expectedVersion: contract.version, specRevisions: (task.specRevisions ?? 0) + 1 });
@@ -959,7 +1004,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
       if (waitResult.lost) {
         // L1 (live session) lost — recover from L2 durable context in a new pane.
         ctx.ui.notify("Dual-Gate: executor session lost — recovering from checkpoint…", "warning");
-        const recovered = await recoverExecutor(ctx, task, config, contract, store, iteration);
+        const recovered = await recoverExecutor(ctx, task, config, contract, store, iteration, options.projectContext);
         if (taskStopped(task)) return;
         if (!recovered) {
           rt.manager.patch(task.taskId, { state: "FAILED", currentStage: "failed", error: "Executor session lost and recovery failed" });
@@ -993,7 +1038,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
             spec_changes: ["Merge new requirement"],
             delta: { matched: [], missing: [], incorrect: [], unexpected: [], required_changes: [], must_preserve: [] },
             reason: "User requested a change during execution.",
-          }, report, store);
+          }, report, store, options.projectContext);
           if (taskStopped(task)) return;
           if (revised) {
             contract = revised.contract;
@@ -1094,7 +1139,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
       let judgeError: unknown;
       for (let attempt = 0; attempt <= config.judge.max_retries; attempt++) {
         try {
-          judgeOutput = await judge(ctx, task, config, contract, report, diff, gateSummary, lastJudge);
+          judgeOutput = await judge(ctx, task, config, contract, report, diff, gateSummary, lastJudge, options.projectContext);
           break;
         } catch (e) {
           judgeError = e;
@@ -1122,6 +1167,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
         delta: judgeOutput.verdict !== "converged" ? judgeOutput.delta : null,
         gateSummary: formatGateResult(gateResult),
         lastVerdict: judgeOutput.verdict,
+        projectContext: options.projectContext,
       });
       store.write(`checkpoint-it${iteration}.yaml`, checkpoint);
       store.write("checkpoint.yaml", checkpoint);
@@ -1204,7 +1250,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
         rt.manager.patch(task.taskId, { state: "REVISING_SPEC", currentStage: "revising-spec" });
         writeState(task, store);
         ctx.ui.notify("Dual-Gate: spec gap — revising Expected Outcome…", "info");
-        const revised = await reviseSpec(ctx, task, config, contract, judgeOutput, report, store);
+        const revised = await reviseSpec(ctx, task, config, contract, judgeOutput, report, store, options.projectContext);
         if (!revised) {
           // blocked: user intent cannot be satisfied
           rt.manager.patch(task.taskId, { state: "ESCALATED", currentStage: "escalated", verdict: "blocked" });
@@ -1235,6 +1281,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
           originalRequest: task.originalRequest,
           repoPath: cwd,
           taskId: task.taskId,
+          projectContext: options.projectContext,
         });
         store.write("spec-update.md", specUpdatePrompt);
         rt.manager.patch(task.taskId, { state: "FIXING_IMPLEMENTATION", currentStage: "fixing-implementation" });
@@ -1306,7 +1353,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
         // Re-run spec revision
         rt.manager.patch(task.taskId, { state: "REVISING_SPEC", currentStage: "revising-spec-diagnosed" });
         writeState(task, store);
-        const revised = await reviseSpec(ctx, task, config, contract, lastJudge!, report, store);
+        const revised = await reviseSpec(ctx, task, config, contract, lastJudge!, report, store, options.projectContext);
         if (!revised) {
           rt.manager.patch(task.taskId, { state: "ESCALATED", currentStage: "escalated", verdict: "blocked" });
           writeState(task, store);
@@ -1354,7 +1401,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
 // Spawn executor in a Herdr pane
 // ---------------------------------------------------------------------------
 
-async function spawnExecutor(ctx: ExtensionCommandContext, task: TaskRecord, config: ReturnType<typeof normalizeConfig>): Promise<void> {
+async function spawnExecutor(ctx: ExtensionCommandContext, task: TaskRecord, config: ReturnType<typeof normalizeConfig>, projectContext?: ProjectMilestoneContext): Promise<void> {
   const rt = getRuntime();
   const registry = makeRegistry(ctx);
   const configured = config.executor.model;
@@ -1437,6 +1484,7 @@ async function spawnExecutor(ctx: ExtensionCommandContext, task: TaskRecord, con
       taskId: task.taskId,
       panelTitle,
       artifactDir: makeStore(task).dir(),
+      projectContext,
     });
     // Dispatch is deliberately non-blocking: Herdr's --wait can report a
     // false stall after successfully delivering a prompt. Completion is polled.
@@ -1468,6 +1516,7 @@ async function recoverExecutor(
   contract: AcceptanceContract,
   store: ArtifactStore,
   iteration: number,
+  projectContext?: ProjectMilestoneContext,
 ): Promise<boolean> {
   const rt = getRuntime();
   const registry = makeRegistry(ctx);
@@ -1519,6 +1568,7 @@ async function recoverExecutor(
       report: {},
       delta: null,
       gateSummary: "no gate run yet",
+      projectContext,
     });
     const recoveryPrompt = buildRecoveryPrompt({
       taskId: task.taskId,
@@ -1527,6 +1577,7 @@ async function recoverExecutor(
       checkpoint,
       repoPath: cwd,
       delta: null,
+      projectContext,
     });
     store.write("recovery-prompt.md", recoveryPrompt);
 
@@ -1587,6 +1638,132 @@ async function waitForExecutorCompletion(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Persistent read-only Product Manager pane (project mode only)
+// ---------------------------------------------------------------------------
+
+function productManagerStore(project: ProjectRecord): ArtifactStore {
+  return createArtifactStore(join(project.artifactDir, "product-manager"));
+}
+
+function writeProductManagerMetadata(project: ProjectRecord): void {
+  productManagerStore(project).write("metadata.json", project.productManager ?? {});
+  writeProjectState(project);
+}
+
+function pmRequestPrefix(kind: "plan" | "milestone_feedback" | "final_acceptance", payload: Record<string, unknown>): string {
+  if (kind === "plan") return "plan";
+  if (kind === "final_acceptance") return "final-acceptance";
+  return `milestone-${String(payload.milestone_id ?? "unknown")}`;
+}
+
+function nextProductManagerRequestId(project: ProjectRecord): string {
+  const old = project.productManager?.lastRequestId;
+  const n = old?.match(/-(\d+)$/)?.[1];
+  return `pm-${project.projectId}-${(Number(n ?? 0) || 0) + 1}`;
+}
+
+async function spawnProductManager(ctx: ExtensionCommandContext, project: ProjectRecord, config: ReturnType<typeof normalizeConfig>): Promise<void> {
+  const pm: ProductManagerRecord = project.productManager ?? {
+    model: config.product_manager.model, state: "STARTING", recoveryCount: 0,
+  };
+  project.productManager = pm;
+  if (pm.model !== "default" && !findAvailableAuthenticatedModel(makeRegistry(ctx), pm.model)) throw new Error(`Product Manager model is not available with configured authentication: ${pm.model}`);
+  const problem = herdrEnvironmentProblem();
+  if (problem) throw new Error(problem);
+  const title = deriveProductManagerTitle(project.projectId, project.repoPath);
+  const name = deriveProductManagerName(project.projectId);
+  const splitCwd = ctx.cwd ?? project.repoPath;
+  let paneId: string | null = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const candidate = await herdrPaneSplit({ direction: config.panel.direction, cwd: splitCwd, noFocus: true, ratio: config.panel.ratio });
+    await sleep(1500);
+    if (await herdrPaneExists(candidate)) { paneId = candidate; break; }
+  }
+  if (!paneId) throw new Error("failed to create a persistent Product Manager pane after 3 attempts");
+  await exec("herdr", ["pane", "rename", paneId, title], { timeoutMs: 15_000 });
+  await herdrAgentStart({ name, kind: "pi", pane: paneId, timeoutMs: 180_000, args: productManagerPiArgs(pm.model) });
+  pm.paneId = paneId; pm.agentName = name; pm.state = "ACTIVE"; pm.error = undefined;
+  writeProductManagerMetadata(project);
+  ctx.ui.notify(`Dual-Gate: Product Manager ready in ${title}`, "info");
+}
+
+async function waitForProductManagerCompletion(project: ProjectRecord, timeoutMs = 10 * 60 * 1000): Promise<{ completed: boolean; lost?: boolean; state?: string }> {
+  const agent = project.productManager?.agentName;
+  if (!agent) return { completed: false, lost: true };
+  const started = Date.now(); let missing = 0; let state = "unknown";
+  while (Date.now() - started < timeoutMs) {
+    if (project.status === "CANCELLED" || getRuntime().stopRequested) return { completed: false, state };
+    const current = await herdrAgentGet({ target: agent });
+    if (!current.state && current.idle === undefined) {
+      if (++missing >= 3) return { completed: false, lost: true, state };
+    } else {
+      missing = 0; state = current.state ?? (current.idle ? "idle" : state);
+      if (state === "idle" || state === "done" || state === "blocked") return { completed: true, state };
+    }
+    await sleep(2000);
+  }
+  return { completed: false, state };
+}
+
+async function recoverProductManager(ctx: ExtensionCommandContext, project: ProjectRecord, config: ReturnType<typeof normalizeConfig>, requestId: string, request: unknown, originalPrompt: string): Promise<boolean> {
+  const pm = project.productManager;
+  if (!pm || pm.recoveryCount >= 1) return false;
+  pm.recoveryCount++; pm.state = "RECOVERING";
+  writeProductManagerMetadata(project);
+  try {
+    if (pm.paneId) await herdrPaneClose(pm.paneId).catch(() => {});
+    const title = `${deriveProductManagerTitle(project.projectId, project.repoPath)} · recovered`;
+    const name = `${deriveProductManagerName(project.projectId)}-r`.slice(0, 31);
+    const paneId = await herdrPaneSplit({ direction: config.panel.direction, cwd: ctx.cwd ?? project.repoPath, noFocus: true, ratio: config.panel.ratio });
+    await sleep(1500);
+    if (!await herdrPaneExists(paneId)) throw new Error("recovery PM pane was recycled");
+    await exec("herdr", ["pane", "rename", paneId, title], { timeoutMs: 15_000 });
+    await herdrAgentStart({ name, kind: "pi", pane: paneId, timeoutMs: 180_000, args: productManagerPiArgs(pm.model) });
+    pm.paneId = paneId; pm.agentName = name; pm.state = "WAITING";
+    const store = productManagerStore(project);
+    const persistedFeedback = readdirSync(store.dir()).filter((name) => /^milestone-.*-feedback\.yaml$/.test(name)).map((name) => store.read(name)).filter(Boolean);
+    const recovery = buildProductManagerRecoveryPrompt({ projectId: project.projectId, requestId, outstandingRequest: { request, originalPrompt }, persistedPlan: store.read("plan.yaml"), persistedFeedback });
+    store.write("recovery-request.json", { requestId, request, recovery, at: new Date().toISOString() });
+    writeProductManagerMetadata(project);
+    const sent = await herdrAgentPrompt({ target: name, text: recovery, wait: false, timeoutMs: 120_000 });
+    if (!sent.ok) throw new Error(sent.error ?? "PM recovery prompt failed");
+    return true;
+  } catch (e) {
+    pm.state = "FAILED"; pm.error = errMsg(e); writeProductManagerMetadata(project); return false;
+  }
+}
+
+async function requestProductManager<T>(ctx: ExtensionCommandContext, project: ProjectRecord, config: ReturnType<typeof normalizeConfig>, kind: "plan" | "milestone_feedback" | "final_acceptance", payload: Record<string, unknown>, promptFor: (requestId: string) => string, parse: (raw: string, requestId: string) => T | null): Promise<T> {
+  const pm = project.productManager;
+  if (!pm?.agentName) throw new Error("Product Manager session is unavailable");
+  const requestId = nextProductManagerRequestId(project);
+  const prompt = promptFor(requestId);
+  const prefix = pmRequestPrefix(kind, payload);
+  const store = productManagerStore(project);
+  // Persist before transport so an L1 recovery can replay exactly this request.
+  pm.lastRequestId = requestId; pm.lastRequestKind = kind; pm.state = "WAITING";
+  store.write(`${prefix}-request.json`, { ...payload, protocol_version: 1, request_id: requestId, kind, prompt, at: new Date().toISOString() });
+  writeProductManagerMetadata(project);
+  let sent = await herdrAgentPrompt({ target: pm.agentName, text: prompt, wait: false, timeoutMs: 120_000 });
+  if (!sent.ok) throw new Error(`Product Manager prompt failed: ${sent.error}`);
+  let wait = await waitForProductManagerCompletion(project);
+  if (wait.lost) {
+    const recovered = await recoverProductManager(ctx, project, config, requestId, payload, prompt);
+    if (!recovered) throw new Error("Product Manager session lost and recovery failed");
+    wait = await waitForProductManagerCompletion(project);
+  }
+  if (!wait.completed) throw new Error(`Product Manager ${wait.lost ? "session lost" : "timed out"}`);
+  const raw = await herdrAgentRead({ target: project.productManager?.agentName!, lines: 600 });
+  store.write(`${prefix}-response-raw.md`, raw);
+  const result = parse(raw, requestId);
+  if (!result) throw new Error(`Product Manager returned malformed or mismatched ${kind} response`);
+  pm.state = "ACTIVE";
+  store.write(kind === "milestone_feedback" ? `${prefix}-feedback.yaml` : kind === "final_acceptance" ? "product-acceptance.yaml" : "plan.yaml", result as object);
+  writeProductManagerMetadata(project);
+  return result;
 }
 
 /**
@@ -1675,6 +1852,7 @@ async function judge(
   diff: string,
   gateSummary: string,
   previousJudge?: JudgeOutput | null,
+  projectContext?: ProjectMilestoneContext,
 ): Promise<JudgeOutput> {
   const registry = makeRegistry(ctx);
   const controllerRef = registry.find(config.controller.model) ?? { provider: "", id: config.controller.model, name: config.controller.model };
@@ -1697,6 +1875,7 @@ Output ONLY a fenced YAML block with the exact structure described in the user m
     iteration: task.iteration,
     previousJudge,
     expectedVersion: contract.version,
+    projectContext,
   });
 
   const text = await completeText(ctx, controllerRef, system, user, { thinking });
@@ -1719,6 +1898,7 @@ async function reviseSpec(
   judgeOutput: JudgeOutput,
   actualReport: Record<string, unknown>,
   store: ArtifactStore,
+  projectContext?: ProjectMilestoneContext,
 ): Promise<SpecRevisionResult | null> {
   const registry = makeRegistry(ctx);
   const controllerRef = registry.find(config.controller.model) ?? { provider: "", id: config.controller.model, name: config.controller.model };
@@ -1736,6 +1916,7 @@ Output the FULL revised contract as a fenced YAML block with the exact structure
     judge: judgeOutput,
     actualReport,
     repoPath: task.repoPath,
+    projectContext,
   });
 
   const text = await completeText(ctx, controllerRef, system, user, { thinking });
@@ -1896,6 +2077,192 @@ async function presentEscalation(ctx: ExtensionCommandContext, task: TaskRecord,
 }
 
 // ---------------------------------------------------------------------------
+// Project coordinator (outer layer; task loop remains the milestone engine)
+// ---------------------------------------------------------------------------
+
+function writeProjectState(project: ProjectRecord): void {
+  createArtifactStore(project.artifactDir).write("project-state.json", project);
+}
+
+function projectPlanDisplay(plan: ProjectPlan, projectId: string): string {
+  const list = (items: string[]) => items.length ? items.map((x) => `  • ${x}`).join("\n") : "  • (none)";
+  return [
+    `## Dual-Gate Project Plan · ${projectId}`,
+    `**Goal**\n${plan.goal}`,
+    `**Constraints**\n${list(plan.constraints)}`,
+    "**Milestones (serial dependency order)**",
+    ...topologicallyOrderMilestones(plan.milestones).flatMap((m, i) => [
+      `${i + 1}. **${m.id}: ${m.title}** (depends on: ${m.depends_on.join(", ") || "none"})`,
+      `   Scope: ${[...m.scope.files, ...m.scope.components].join(", ")}`,
+      `   Outcome: ${m.expected_outcome.join("; ")}`,
+      `   Acceptance: ${m.acceptance_criteria.join("; ")}`,
+      `   Validation: ${m.validation.required.join("; ")}`,
+      `   Risk: ${m.risk.level}${m.risk.concerns.length ? ` — ${m.risk.concerns.join("; ")}` : ""}`,
+    ]),
+    "**Project acceptance**",
+    list(plan.acceptance_criteria),
+    "**Final validation**",
+    list(plan.validation.required),
+  ].join("\n\n");
+}
+
+function readPersistedProject(cwd: string, projectId: string): ProjectRecord | null {
+  try {
+    const path = join(projectDirFor(cwd, projectId), "project-state.json");
+    return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) as ProjectRecord : null;
+  } catch { return null; }
+}
+
+function presentProjectStatus(project: ProjectRecord): void {
+  const lines = [
+    `Dual-Gate Project ${project.projectId}`,
+    `Status: ${project.status}`,
+    `Current milestone: ${project.currentMilestoneId ?? "none"}`,
+    `Product acceptance: ${project.productAcceptance?.verdict ?? "pending"}`,
+    `Controller ratification: ${project.finalAcceptance ?? "pending"}`,
+    `Product Manager: ${project.productManager?.model ?? "legacy"} · ${project.productManager?.state ?? "not started"} · pane ${project.productManager?.paneId ?? "-"}`,
+    "Milestones:",
+    ...project.orderedMilestoneIds.map((id, i) => { const m = project.milestones[id]; return `  ${i + 1}. ${id}: ${m?.title ?? ""} — ${m?.status ?? "unknown"}${m?.taskId ? ` (${m.taskId})` : ""}`; }),
+    `Artifacts: ${project.artifactDir}`,
+  ];
+  showText(lines.join("\n"));
+}
+
+async function runProject(ctx: ExtensionCommandContext, request: string): Promise<void> {
+  const rt = getRuntime();
+  const config = rt.config;
+  if (config.worktree.mode === "isolated") {
+    ctx.ui.notify("Dual-Gate project mode requires worktree.mode auto or current; isolated milestones cannot share changes.", "error");
+    return;
+  }
+  if (rt.running || rt.manager.active() || (rt.activeProject && isActiveProjectState(rt.activeProject.status))) {
+    ctx.ui.notify("Dual-Gate already has an active task or project", "warning");
+    return;
+  }
+  if (config.product_manager.model !== "default" && !findAvailableAuthenticatedModel(makeRegistry(ctx), config.product_manager.model)) {
+    ctx.ui.notify(`Product Manager model is not available with configured authentication: ${config.product_manager.model}`, "error");
+    return;
+  }
+  rt.running = true;
+  rt.stopRequested = false;
+  const projectId = generateProjectId();
+  const artifactDir = projectDirFor(ctx.cwd, projectId);
+  const store = createArtifactStore(artifactDir);
+  const now = new Date().toISOString();
+  let project: ProjectRecord = { projectId, sourceRequest: request, repoPath: normalizeRepoPath(ctx.cwd), artifactDir, status: "PLANNING", orderedMilestoneIds: [], milestones: {}, productManager: { model: config.product_manager.model, state: "STARTING", recoveryCount: 0 }, createdAt: now, updatedAt: now };
+  rt.activeProject = project;
+  writeProjectState(project);
+  try {
+    const registry = makeRegistry(ctx);
+    const controller = registry.find(config.controller.model) ?? { provider: "", id: config.controller.model, name: config.controller.model };
+    // The PM is created once before WBS generation and persists through final acceptance.
+    await spawnProductManager(ctx, project, config);
+    const plan = await requestProductManager(ctx, project, config, "plan", { source_request: request, repo_path: project.repoPath }, (requestId) => buildProductManagerPlanPrompt({ sourceRequest: request, repoPath: project.repoPath, requestId }), (raw, requestId) => {
+      const block = extractCorrelatedYamlBlock(raw, requestId, "plan");
+      try { return block ? parseProjectPlan(block) : null; } catch { return null; }
+    });
+    const ordered = topologicallyOrderMilestones(plan.milestones);
+    project.orderedMilestoneIds = ordered.map((m) => m.id);
+    for (const m of ordered) project.milestones[m.id] = { title: m.title, status: "PENDING" };
+    store.write("project-plan.yaml", JSON.stringify(plan, null, 2));
+    project.status = "AWAITING_APPROVAL"; project.updatedAt = new Date().toISOString(); writeProjectState(project);
+    showText(projectPlanDisplay(plan, projectId));
+    const approved = await ctx.ui.confirm("Approve project plan", `Execute ${ordered.length} serial milestones for: ${plan.goal}?`);
+    store.write("project-approval.json", { approved, at: new Date().toISOString() });
+    if (!approved || project.status === "CANCELLED" || rt.stopRequested) {
+      project.status = "CANCELLED"; project.updatedAt = new Date().toISOString();
+      if (project.productManager) {
+        project.productManager.state = "CANCELLED";
+        if (project.productManager.paneId) await exec("herdr", ["pane", "rename", project.productManager.paneId, `${deriveProductManagerTitle(project.projectId, project.repoPath)} · CANCELLED`], { timeoutMs: 15_000 }).catch(() => {});
+        writeProductManagerMetadata(project);
+      }
+      writeProjectState(project); return;
+    }
+    project.status = "RUNNING"; project.updatedAt = new Date().toISOString(); writeProjectState(project);
+    const completed: ProjectMilestoneContext["completedSummaries"] = [];
+    for (const milestone of ordered) {
+      const record = project.milestones[milestone.id];
+      if (!milestone.depends_on.every((id) => project.milestones[id]?.status === "CONVERGED")) { record.status = "BLOCKED"; project.status = "BLOCKED"; break; }
+      project.currentMilestoneId = milestone.id; record.status = "RUNNING"; project.updatedAt = new Date().toISOString(); writeProjectState(project);
+      const milestoneStore = createArtifactStore(projectMilestoneDirFor(ctx.cwd, projectId, milestone.id));
+      milestoneStore.write("milestone.yaml", JSON.stringify(milestone, null, 2));
+      milestoneStore.write("state.json", record);
+      let contract = milestoneToAcceptanceContract(plan, milestone, request);
+      const riskText = [request, milestone.title, ...milestone.expected_outcome, ...milestone.acceptance_criteria, ...milestone.risk.concerns].join("\n");
+      contract = higherRisk(contract, detectRisk(riskText));
+      const task = rt.manager.begin(request, { controller: resolveModelString(config.controller.model) ?? controller, executor: resolveModelString(config.executor.model) ?? { provider: "", id: config.executor.model, name: config.executor.model } }, detectRisk(riskText).level);
+      record.taskId = task.taskId; record.taskArtifactDir = task.artifactDir;
+      const context: ProjectMilestoneContext = { projectId, projectGoal: plan.goal, milestoneId: milestone.id, milestoneTitle: milestone.title, scope: milestone.scope, dependsOn: milestone.depends_on, completedSummaries: completed };
+      await orchestrate(ctx, task, { initialContract: contract, projectContext: context });
+      rt.running = true; // the task runner clears its own flag; the project still owns input
+      const taskStore = makeStore(task);
+      const report = extractReportFromAgentMessage(taskStore.read("executor-report.yaml") ?? "");
+      const judge = parseJudgeOutput(taskStore.read("judge.yaml") ?? "");
+      record.status = task.state === "DONE" && judge?.verdict === "converged" && !(report.unresolved as unknown[] ?? []).length ? "CONVERGED" : task.state === "CANCELLED" ? "CANCELLED" : task.state === "ESCALATED" ? "BLOCKED" : "FAILED";
+      record.summary = typeof report.summary === "string" ? report.summary : ""; record.verdict = judge?.verdict; record.unresolved = Array.isArray(report.unresolved) ? report.unresolved.map(String) : []; record.deviations = Array.isArray(report.deviations) ? report.deviations.map(String) : []; record.completedAt = new Date().toISOString();
+      milestoneStore.write("task-ref.json", { taskId: task.taskId, taskArtifactDir: task.artifactDir, taskState: task.state, judgeVerdict: judge?.verdict, completedAt: record.completedAt });
+      milestoneStore.write("state.json", record);
+      project.updatedAt = new Date().toISOString(); writeProjectState(project);
+      if (record.status !== "CONVERGED") { project.status = record.status === "BLOCKED" ? "BLOCKED" : record.status === "CANCELLED" ? "CANCELLED" : "FAILED"; break; }
+      // The PM sees a bounded, persisted handoff only after task DONE/Judge convergence.
+      const feedbackBase: ProjectMilestoneFeedback = {
+        protocol_version: 1, request_id: "", kind: "milestone_feedback", milestone_id: milestone.id, task_id: task.taskId,
+        executor_summary: (record.summary ?? "").slice(0, 8000), judge: { verdict: judge?.verdict ?? "blocked", gaps: (judge?.gaps ?? []).slice(0, 20).map((gap) => gap.slice(0, 1000)) },
+        gate_summary: (taskStore.read("gate.log") ?? "").slice(0, 12000), unresolved: (record.unresolved ?? []).slice(0, 20).map((item) => item.slice(0, 1000)), deviations: (record.deviations ?? []).slice(0, 20).map((item) => item.slice(0, 1000)),
+        artifact_refs: { taskArtifactDir: task.artifactDir, milestoneArtifactDir: milestoneStore.dir() },
+      };
+      const pmFeedback = await requestProductManager(ctx, project, config, "milestone_feedback", feedbackBase as unknown as Record<string, unknown>, (requestId) => buildMilestoneCompletionFeedbackPrompt({ ...feedbackBase, request_id: requestId }), parseProductMilestoneFeedback);
+      const persistedFeedback = { ...feedbackBase, ...pmFeedback, request_id: project.productManager?.lastRequestId ?? "" };
+      productManagerStore(project).write(`milestone-${milestone.id}-feedback.yaml`, persistedFeedback);
+      if (pmFeedback.decision === "blocked") { project.status = "BLOCKED"; project.error = pmFeedback.reason; project.updatedAt = new Date().toISOString(); writeProjectState(project); break; }
+      completed.push({ milestoneId: milestone.id, title: milestone.title, summary: record.summary ?? "", verdict: "converged" });
+    }
+    if (project.status !== "RUNNING") {
+      if (project.productManager && project.productManager.state !== "CANCELLED" && project.productManager.state !== "FAILED") { project.productManager.state = "DONE"; writeProductManagerMetadata(project); }
+      return;
+    }
+    project.status = "ACCEPTING"; project.currentMilestoneId = undefined; project.updatedAt = new Date().toISOString(); writeProjectState(project);
+    const finalStore = createArtifactStore(project.artifactDir);
+    const discovery = config.gate.enabled ? discoverGateCommands(project.repoPath) : { commands: [], notes: ["Deterministic gate disabled by configuration."] };
+    finalStore.write("final-gate-discovery.json", { commands: discovery.commands, notes: discovery.notes });
+    const finalGate = config.gate.enabled ? await runGate(project.repoPath, discovery, { timeoutMs: config.gate.timeoutMs }) : skippedGateResult("Deterministic gate disabled by configuration.");
+    if (isProjectFinalizationStopped(project.status, rt.stopRequested)) return;
+    finalStore.write("final-gate.log", formatGateResult(finalGate));
+    const diff = await getDiff(project.repoPath);
+    if (isProjectFinalizationStopped(project.status, rt.stopRequested)) return;
+    const milestoneResults = ordered.map((m) => ({ milestoneId: m.id, title: m.title, summary: project.milestones[m.id].summary ?? "", verdict: project.milestones[m.id].verdict ?? "", unresolved: project.milestones[m.id].unresolved ?? [], deviations: project.milestones[m.id].deviations ?? [] }));
+    const productAcceptance = await requestProductManager(ctx, project, config, "final_acceptance", { plan, milestones: milestoneResults, gate_summary: formatGateResult(finalGate), diff }, (requestId) => buildProductAcceptancePrompt({ requestId, plan, milestones: milestoneResults, diff, gateSummary: formatGateResult(finalGate) }), parseProjectAcceptance);
+    if (isProjectFinalizationStopped(project.status, rt.stopRequested)) return;
+    project.productAcceptance = productAcceptance; writeProjectState(project);
+    const acceptanceRaw = await completeText(ctx, controller, "You are the final Controller ratifier. Output only the requested fenced YAML.", buildProjectAcceptancePrompt({ plan, milestones: milestoneResults, diff, gateSummary: formatGateResult(finalGate), productAcceptance }), { thinking: config.controller.thinking });
+    if (isProjectFinalizationStopped(project.status, rt.stopRequested)) return;
+    finalStore.write("controller-ratification-raw.md", acceptanceRaw);
+    const acceptance = parseProjectAcceptance(acceptanceRaw);
+    finalStore.write("controller-ratification.yaml", JSON.stringify(acceptance ?? { verdict: "blocked", reason: "unparseable ratification" }, null, 2));
+    // Keep the Stage-1 field/artifact name as controller ratification compatibility data.
+    project.finalAcceptance = acceptance?.verdict;
+    project.status = canAcceptProject({ orderedMilestoneIds: project.orderedMilestoneIds, milestones: project.milestones, finalGatePassed: finalGate.passed, productAcceptance, acceptance }) ? "ACCEPTED" : productAcceptance.verdict === "blocked" || acceptance?.verdict === "blocked" ? "BLOCKED" : "REJECTED";
+    project.updatedAt = new Date().toISOString(); writeProjectState(project);
+    finalStore.write("project-acceptance-report.md", `# Project ${project.status}\n\nProduct Manager: ${productAcceptance.summary}\n\nController ratification: ${acceptance?.summary ?? "could not be parsed"}\n\n${formatGateResult(finalGate)}`);
+    if (project.productManager) { project.productManager.state = "DONE"; writeProductManagerMetadata(project); }
+    showText(`Dual-Gate Project ${project.status}\nProject: ${projectId}\nFinal gate: ${finalGate.passed ? "passed" : "failed"}\nProduct acceptance: ${productAcceptance.verdict}\nController ratification: ${acceptance?.verdict ?? "unparseable"}`);
+  } catch (e) {
+    if (project.status !== "CANCELLED") {
+      project.status = "FAILED"; project.error = errMsg(e); project.updatedAt = new Date().toISOString();
+      if (project.productManager) { project.productManager.state = "FAILED"; project.productManager.error = errMsg(e); writeProductManagerMetadata(project); }
+      writeProjectState(project);
+      ctx.ui.notify(`Dual-Gate project failed: ${errMsg(e)}`, "error");
+    }
+  } finally {
+    rt.running = false;
+    // PM is kept for inspection unless the existing completion policy requests closure.
+    if (config.panel.on_complete === "close" && project.productManager?.paneId && !isActiveProjectState(project.status)) await herdrPaneClose(project.productManager.paneId).catch(() => {});
+    updateWidget(ctx);
+    // Retain terminal project state for /dual status during this session.
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -1911,6 +2278,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     pauseRequested: false,
     resumeRequested: false,
     pendingResumeRequirement: undefined,
+    activeProject: null,
   };
 
   const rt = getRuntime();
@@ -1946,7 +2314,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
 
     // A Dual-Gate task owns the next non-command input. Do not let the main
     // Pi model execute it in parallel with the Controller/Executor workflow.
-    if (rt.running || active) return { action: "handled" };
+    if (rt.running || active || (rt.activeProject && isActiveProjectState(rt.activeProject.status))) return { action: "handled" };
 
     if ((globalThis as any).__dg_handling_input) return { action: "handled" };
     (globalThis as any).__dg_handling_input = true;
@@ -1968,10 +2336,12 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
   const SUBCOMMANDS: Array<{ name: string; label: string; description: string }> = [
     { name: "on", label: "Turn ON", description: "Enable Dual-Gate (default: off)" },
     { name: "off", label: "Turn OFF", description: "Disable Dual-Gate, restore normal Pi" },
-    { name: "status", label: "Status", description: "Show current state (models, task, pane, session)" },
+    { name: "status", label: "Status", description: "Show current state (models, task, pane, session, project)" },
+    { name: "project", label: "Project", description: "Open PM third pane, approve WBS, then run serial milestones" },
     { name: "models", label: "Models", description: "Show current model configuration" },
     { name: "controller", label: "Controller / Judge", description: "Pick the Controller/Judge model" },
     { name: "executor", label: "Executor", description: "Pick the Executor model" },
+    { name: "product-manager", label: "Product Manager", description: "Pick the project-only read-only PM model" },
     { name: "thinking", label: "Thinking level", description: "Set Controller thinking level (minimal..max)" },
     { name: "cancel", label: "Cancel task", description: "Cancel the active task, keep the pane" },
     { name: "pause", label: "Pause task", description: "Pause the active task (Executor kept alive)" },
@@ -1982,7 +2352,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
   ];
 
   pi.registerCommand("dual", {
-    description: "Dual-Gate Orchestrator: on/off/status/models/thinking/controller/executor/cancel/bypass/cleanup",
+    description: "Dual-Gate Orchestrator: on/off/status/models/thinking/controller/executor/product-manager/cancel/bypass/cleanup",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
       const p = (prefix ?? "").trim().split(/\s+/).filter(Boolean);
       if (p.length > 1) return null; // only complete the first (subcommand) token
@@ -2034,6 +2404,17 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
           if (active) {
             rt.manager.cancelActive("Dual-Gate disabled by user");
             writeState(active, makeStore(active));
+            if (active.herdrPanelId) await exec("herdr", ["pane", "rename", active.herdrPanelId, `${derivePanelTitle(active.taskId, basename(active.repoPath), active.originalRequest)} · CANCELLED`], { timeoutMs: 15_000 }).catch(() => {});
+          }
+          if (rt.activeProject && isActiveProjectState(rt.activeProject.status)) {
+            const project = rt.activeProject;
+            project.status = "CANCELLED"; project.updatedAt = new Date().toISOString();
+            if (project.productManager) {
+              project.productManager.state = "CANCELLED";
+              if (project.productManager.paneId) await exec("herdr", ["pane", "rename", project.productManager.paneId, `${deriveProductManagerTitle(project.projectId, project.repoPath)} · CANCELLED`], { timeoutMs: 15_000 }).catch(() => {});
+              writeProductManagerMetadata(project);
+            }
+            writeProjectState(project);
           }
           rt.config.enabled = false;
           saveConfig({ enabled: false });
@@ -2045,6 +2426,18 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
         }
         case "status": {
           await showStatus(ctx, rt);
+          break;
+        }
+        case "project": {
+          if (rest[0]?.toLowerCase() === "status") {
+            const project = rest[1] ? readPersistedProject(ctx.cwd, rest[1]) : rt.activeProject;
+            if (project) presentProjectStatus(project);
+            else ctx.ui.notify(rest[1] ? `Project ${rest[1]} not found` : "No project in this session; provide a project ID", "info");
+          } else if (rest.length) {
+            await runProject(ctx, rest.join(" "));
+          } else {
+            ctx.ui.notify("Usage: /dual project <request> or /dual project status", "info");
+          }
           break;
         }
         case "models": {
@@ -2059,22 +2452,39 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
           await setExecutor(ctx, rt, rest);
           break;
         }
+        case "product-manager": {
+          await setProductManager(ctx, rt, rest);
+          break;
+        }
         case "thinking": {
           await setThinking(ctx, rt, rest);
           break;
         }
         case "cancel": {
-          const t = rt.manager.cancelActive("cancelled by user");
-          if (t) {
-            writeState(t, makeStore(t));
-            // Mark pane title CANCELLED (pane kept for inspection).
-            if (t.herdrPanelId) {
-              const base = derivePanelTitle(t.taskId, basename(t.repoPath), t.originalRequest);
-              await exec("herdr", ["pane", "rename", t.herdrPanelId, `${base} · CANCELLED`], { timeoutMs: 15_000 }).catch(() => {});
+          // Project cancellation takes precedence over its currently active child task.
+          const project = rt.activeProject;
+          if (project && isActiveProjectState(project.status)) {
+            rt.stopRequested = true;
+            project.status = "CANCELLED"; project.updatedAt = new Date().toISOString();
+            if (project.productManager) {
+              project.productManager.state = "CANCELLED";
+              if (project.productManager.paneId) await exec("herdr", ["pane", "rename", project.productManager.paneId, `${deriveProductManagerTitle(project.projectId, project.repoPath)} · CANCELLED`], { timeoutMs: 15_000 }).catch(() => {});
+              writeProductManagerMetadata(project);
             }
-            ctx.ui.notify(`Dual-Gate: task ${t.taskId} cancelled (panel kept open)`, "info");
+            const child = rt.manager.cancelActive("project cancelled by user");
+            if (child) {
+              writeState(child, makeStore(child));
+              if (child.herdrPanelId) await exec("herdr", ["pane", "rename", child.herdrPanelId, `${derivePanelTitle(child.taskId, basename(child.repoPath), child.originalRequest)} · CANCELLED`], { timeoutMs: 15_000 }).catch(() => {});
+            }
+            writeProjectState(project);
+            ctx.ui.notify(`Dual-Gate: project ${project.projectId} cancelled`, "info");
           } else {
-            ctx.ui.notify("Dual-Gate: no active task", "info");
+            const t = rt.manager.cancelActive("cancelled by user");
+            if (t) {
+              writeState(t, makeStore(t));
+              if (t.herdrPanelId) await exec("herdr", ["pane", "rename", t.herdrPanelId, `${derivePanelTitle(t.taskId, basename(t.repoPath), t.originalRequest)} · CANCELLED`], { timeoutMs: 15_000 }).catch(() => {});
+              ctx.ui.notify(`Dual-Gate: task ${t.taskId} cancelled (panel kept open)`, "info");
+            } else ctx.ui.notify("Dual-Gate: no active task", "info");
           }
           updateWidget(ctx);
           break;
@@ -2123,10 +2533,13 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
             [
               "Dual-Gate commands:",
               "  /dual on|off               enable / disable",
-              "  /dual status               current state",
+              "  /dual status               current task/project state",
+              "  /dual project <request>    open PM third pane, plan/approve, then run serial milestones",
+              "  /dual project status       project progress",
               "  /dual models               model configuration",
               "  /dual controller [id]      pick controller model",
               "  /dual executor [id|default]  pick executor model (default = follow main Pi)",
+              "  /dual product-manager [id|default]  pick read-only project PM model",
               "  /dual thinking [level]     thinking level (minimal..max)",
               "  /dual cancel               cancel active task",
               "  /dual pause                pause active task (Executor kept alive)",
@@ -2154,8 +2567,16 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
       lines.push(`Controller   ${ctl?.id ?? "?"}`);
       lines.push(`Thinking     ${config.controller.thinking}`);
       lines.push(`Executor     ${exe ? exe.id : "default（跟随主 Pi）"}`);
+      const pmRaw = config.product_manager.model;
+      const pm = pmRaw === "default" ? null : resolveModelString(pmRaw);
+      lines.push(`Product PM   ${pm ? pm.id : "default（跟随主 Pi）"} · project-only read-only pane`);
       lines.push("Herdr        " + (herdrOk ? "Ready" : "NOT DETECTED"));
       lines.push(`Config       ${CONFIG_PATH} (跨 session/项目持久化)`);
+      if (rt.activeProject) {
+        const project = rt.activeProject;
+        const current = project.currentMilestoneId ? project.milestones[project.currentMilestoneId] : undefined;
+        lines.push("", "Project", `  ${project.projectId} · ${project.status}`, `  Milestone ${project.currentMilestoneId ?? "-"}: ${current?.title ?? "-"} (${current?.status ?? "-"}) · ${project.orderedMilestoneIds.length} total`, `  PM ${project.productManager?.state ?? "not started"} · pane ${project.productManager?.paneId ?? "-"}`, `  Product acceptance ${project.productAcceptance?.verdict ?? "pending"} · Controller ratification ${project.finalAcceptance ?? "pending"}`);
+      }
       if (task) {
         const s = stateOf(task);
         const paneName = task.herdrPanelId
@@ -2192,14 +2613,19 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     const reg = makeRegistry(ctx);
     const ctlValid = reg.find(config.controller.model) ? "✓" : "⚠";
     const exeValid = exeRaw === "default" ? "✓" : reg.find(exeRaw) ? "✓" : "⚠";
+    const pmRaw = config.product_manager.model;
+    const pm = pmRaw === "default" ? null : resolveModelString(pmRaw);
+    const pmValid = pmRaw === "default" ? "✓" : findAvailableAuthenticatedModel(reg, pmRaw) ? "✓" : "⚠";
     showText(
       [
         "Dual-Gate Models",
         `Controller / Judge  ${ctl?.id ?? "?"} ${ctlValid}`,
         `Thinking            ${config.controller.thinking}`,
         `Executor            ${exe ? exe.id : "default（跟随主 Pi）"} ${exeValid}`,
+        `Product Manager     ${pm ? pm.id : "default（跟随主 Pi）"} ${pmValid} (project-only, read-only pane)`,
+        rt.activeProject?.productManager ? `PM session          ${rt.activeProject.productManager.state} · pane ${rt.activeProject.productManager.paneId ?? "-"}` : "PM session          no active project",
         "",
-        "Set with:  /dual controller [id]   /dual executor [id]   /dual thinking [level]",
+        "Set with:  /dual controller [id]   /dual executor [id]   /dual product-manager [id|default]   /dual thinking [level]",
         "Available models come from the current Pi registry (ctx.modelRegistry).",
         `Persisted to: ${CONFIG_PATH} (跨 session/项目生效)`,
       ].join("\n"),
@@ -2267,6 +2693,29 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     }
   }
 
+  async function setProductManager(ctx: ExtensionCommandContext, rt: DgRuntime, rest: string[]): Promise<void> {
+    const set = (model: string, label: string) => {
+      rt.config.product_manager.model = model;
+      saveConfig({ product_manager: { model } } as Partial<ReturnType<typeof normalizeConfig>>);
+      ctx.ui.notify(`Product Manager → ${label}（仅项目模式，只读 pane；已保存）`, "success");
+    };
+    if (rest.length) {
+      const spec = rest.join(" ");
+      if (spec.toLowerCase() === "default") { set("default", "default（跟随主 Pi 当前模型）"); return; }
+      const ref = findAvailableAuthenticatedModel(makeRegistry(ctx), spec);
+      if (!ref) { ctx.ui.notify(`Product Manager model is not available with configured authentication: ${spec}`, "error"); return; }
+      set(`${ref.provider}/${ref.id}`, ref.id); return;
+    }
+    const registry = makeRegistry(ctx);
+    const pmModels = registry.available().filter((model) => registry.hasAuth(model));
+    const labels = ["default（跟随主 Pi 当前模型）", ...pmModels.map((m) => `${m.provider}/${m.id}${m.name && m.name !== `${m.provider}/${m.id}` ? ` — ${m.name}` : ""}`)];
+    const chosen = await ctx.ui.select("Product Manager model:", labels);
+    if (!chosen) return;
+    if (chosen.startsWith("default")) { set("default", "default（跟随主 Pi 当前模型）"); return; }
+    const picked = pmModels[labels.indexOf(chosen) - 1];
+    if (picked) set(`${picked.provider}/${picked.id}`, picked.id);
+  }
+
   async function setThinking(ctx: ExtensionCommandContext, rt: DgRuntime, rest: string[]): Promise<void> {
     if (rest.length > 0) {
       const level = rest[0].toLowerCase();
@@ -2300,8 +2749,10 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
 
   async function cleanup(ctx: ExtensionCommandContext, rt: DgRuntime): Promise<void> {
     const done = rt.manager.all().filter((t) => ["DONE", "FAILED", "CANCELLED", "ESCALATED"].includes(t.state) && t.herdrPanelId);
-    if (done.length === 0) {
-      ctx.ui.notify("Dual-Gate: no done worker panels to clean up", "info");
+    const pm = rt.activeProject?.productManager;
+    const closePm = !!pm?.paneId && ["DONE", "FAILED", "CANCELLED"].includes(pm.state);
+    if (done.length === 0 && !closePm) {
+      ctx.ui.notify("Dual-Gate: no terminal worker or Product Manager panes to clean up", "info");
       return;
     }
     for (const t of done) {
@@ -2314,6 +2765,10 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
         }
       }
     }
-    ctx.ui.notify(`Dual-Gate: cleaned up ${done.length} panel(s)`, "success");
+    if (closePm && pm?.paneId) {
+      try { await herdrPaneClose(pm.paneId); ctx.ui.notify(`Closed Product Manager panel ${pm.paneId}`, "info"); }
+      catch (e) { ctx.ui.notify(`Failed to close Product Manager ${pm.paneId}: ${errMsg(e)}`, "warning"); }
+    }
+    ctx.ui.notify(`Dual-Gate: cleaned up ${done.length + (closePm ? 1 : 0)} panel(s)`, "success");
   }
 }

@@ -15,6 +15,7 @@ import {
   normalizeConfig,
   isThinking,
   resolveModelString,
+  findAvailableAuthenticatedModel,
   generateTaskId,
   derivePanelTitle,
   deriveAgentName,
@@ -38,6 +39,29 @@ import {
   parseConvergenceDiagnosis,
   createArtifactStore,
   taskDirFor,
+  generateProjectId,
+  projectDirFor,
+  projectMilestoneDirFor,
+  parseProjectPlan,
+  validateProjectPlan,
+  topologicallyOrderMilestones,
+  milestoneToAcceptanceContract,
+  buildProjectPlanPrompt,
+  buildProductManagerPlanPrompt,
+  buildMilestoneCompletionFeedbackPrompt,
+  buildProductAcceptancePrompt,
+  buildProductManagerRecoveryPrompt,
+  productManagerPiArgs,
+  extractCorrelatedYamlBlock,
+  parseProductMilestoneFeedback,
+  buildProjectAcceptancePrompt,
+  parseProjectAcceptance,
+  isActiveProjectState,
+  isProjectFinalizationStopped,
+  canAcceptProject,
+  buildSpecUpdatePrompt,
+  buildExecutorCheckpoint,
+  buildRecoveryPrompt,
 } from "../extension/core.ts";
 import { discoverGateCommands, runGate, formatGateResult, skippedGateResult } from "../extension/gate.ts";
 
@@ -72,6 +96,7 @@ test("config defaults", () => {
   assert.equal(c.controller.model, "openai-codex/gpt-5.6-sol");
   assert.equal(c.controller.thinking, "medium");
   assert.equal(c.executor.model, "new-api/deepseek-v4-flash");
+  assert.equal(c.product_manager.model, "default");
   assert.equal(c.gate.max_retries, 3);
   assert.equal(c.judge.max_retries, 2);
   assert.equal(c.loop.max_iterations, 5);
@@ -87,6 +112,12 @@ test("config normalize partial", () => {
   // untouched defaults preserved
   assert.equal(c.gate.max_retries, 3);
   assert.equal(c.executor.model, "new-api/deepseek-v4-flash");
+  assert.equal(c.product_manager.model, "default"); // legacy config remains safe
+});
+
+test("product manager config accepts only nonempty model values", () => {
+  assert.equal(normalizeConfig({ product_manager: { model: "provider/pm" } } as any).product_manager.model, "provider/pm");
+  assert.equal(normalizeConfig({ product_manager: { model: "  " } } as any).product_manager.model, "default");
 });
 
 test("config rejects invalid values", () => {
@@ -106,6 +137,22 @@ test("resolveModelString", () => {
   assert.deepEqual(resolveModelString("opencode/gpt-5.6-sol"), { provider: "opencode", id: "gpt-5.6-sol", name: "opencode/gpt-5.6-sol" });
   assert.deepEqual(resolveModelString("deepseek-v4-flash"), { provider: "", id: "deepseek-v4-flash", name: "deepseek-v4-flash" });
   assert.equal(resolveModelString("  "), null);
+});
+
+test("strict PM model lookup rejects synthetic, unknown, and unauthenticated models", () => {
+  const registry = {
+    // Mirrors Pi's permissive qualified lookup: strict PM selection must not use it.
+    find: (spec: string) => resolveModelString(spec),
+    available: () => [
+      { provider: "provider", id: "known", name: "Known PM" },
+      { provider: "provider", id: "unauthenticated", name: "Unauthenticated PM" },
+    ],
+    clampThinking: () => "off" as const,
+    hasAuth: (model: { id: string }) => model.id === "known",
+  };
+  assert.deepEqual(findAvailableAuthenticatedModel(registry, "provider/known"), { provider: "provider", id: "known", name: "Known PM" });
+  assert.equal(findAvailableAuthenticatedModel(registry, "provider/nonexistent"), null);
+  assert.equal(findAvailableAuthenticatedModel(registry, "provider/unauthenticated"), null);
 });
 
 // ---------------------------------------------------------------------------
@@ -623,6 +670,164 @@ test("gate runGate fails on exit 1", async () => {
 test("formatGateResult", () => {
   const r = formatGateResult({ passed: false, steps: [{ name: "npm:test", command: "npm test", passed: false, skipped: false, exitCode: 1, outputTail: "", durationMs: 10 }] });
   assert.ok(r.includes("[FAIL]"));
+});
+
+// ---------------------------------------------------------------------------
+// 10. Project planning and acceptance (pure outer-coordinator contracts)
+// ---------------------------------------------------------------------------
+
+const projectYaml = `goal: Ship project flow
+context: Existing task loop remains intact
+constraints:
+  - Preserve task loop
+acceptance_criteria:
+  - All milestones converge
+validation:
+  required:
+    - node --test
+milestones:
+  - id: M1
+    title: Foundation
+    depends_on: []
+    scope:
+      files:
+        - extension/core.ts
+      components: []
+    expected_outcome:
+      - Project contracts exist
+    acceptance_criteria:
+      - Parser validates plans
+    validation:
+      required:
+        - node --test
+    risk:
+      level: low
+      concerns: []
+  - id: M2
+    title: Coordinator
+    depends_on:
+      - M1
+    scope:
+      files:
+        - extension/dual-gate.ts
+      components: []
+    expected_outcome:
+      - Project command runs serially
+    acceptance_criteria:
+      - Dependencies are respected
+    validation:
+      required:
+        - node --test
+    risk:
+      level: medium
+      concerns:
+        - orchestration
+`;
+
+test("project plan parses and orders stable WBS", () => {
+  const plan = parseProjectPlan(projectYaml);
+  assert.equal(plan.goal, "Ship project flow");
+  assert.deepEqual(topologicallyOrderMilestones(plan.milestones).map((m) => m.id), ["M1", "M2"]);
+  assert.deepEqual(validateProjectPlan(plan), []);
+});
+
+test("project plan rejects missing fields, duplicate IDs, unknown/self/cyclic dependencies", () => {
+  assert.throws(() => parseProjectPlan("goal: x\nacceptance_criteria: []\nvalidation:\n  required: []\nmilestones: []"), /Invalid project plan/);
+  const plan = parseProjectPlan(projectYaml);
+  const duplicate = structuredClone(plan); duplicate.milestones[1].id = "M1";
+  assert.ok(validateProjectPlan(duplicate).some((e) => e.includes("duplicate")));
+  const unknown = structuredClone(plan); unknown.milestones[1].depends_on = ["NOPE"];
+  assert.ok(validateProjectPlan(unknown).some((e) => e.includes("unknown")));
+  const self = structuredClone(plan); self.milestones[0].depends_on = ["M1"];
+  assert.ok(validateProjectPlan(self).some((e) => e.includes("itself")));
+  const cycle = structuredClone(plan); cycle.milestones[0].depends_on = ["M2"];
+  assert.ok(validateProjectPlan(cycle).some((e) => e.includes("cycle")));
+});
+
+test("milestone projects to unchanged acceptance contract and project paths are isolated", () => {
+  const plan = parseProjectPlan(projectYaml);
+  const contract = milestoneToAcceptanceContract(plan, plan.milestones[1], "exact original request");
+  assert.equal(contract.task.original_request, "exact original request");
+  assert.deepEqual(contract.architecture.relevant_components, ["extension/dual-gate.ts"]);
+  assert.deepEqual(contract.acceptance_criteria, ["Dependencies are respected"]);
+  assert.ok(contract.constraints.some((x) => x.includes("Preserve task loop")));
+  assert.match(generateProjectId(new Date(2026, 8, 14)), /^project-20260914-/);
+  assert.equal(projectDirFor("/repo", "project-x"), "/repo/.pi/dual-gate/projects/project-x");
+  assert.equal(projectMilestoneDirFor("/repo", "project-x", "M1"), "/repo/.pi/dual-gate/projects/project-x/milestones/M1");
+});
+
+test("project prompts and optional milestone context preserve existing schemas", () => {
+  const plan = parseProjectPlan(projectYaml);
+  const contract = milestoneToAcceptanceContract(plan, plan.milestones[0], "request");
+  const context = { projectId: "project-x", projectGoal: plan.goal, milestoneId: "M1", milestoneTitle: "Foundation", scope: plan.milestones[0].scope, dependsOn: [], completedSummaries: [] as any[] };
+  assert.ok(buildProjectPlanPrompt({ sourceRequest: "request", repoPath: "/repo" }).includes("depends_on"));
+  assert.ok(buildExecutorPrompt({ originalRequest: "request", contract, repoPath: "/repo", mode: "initial", taskId: "task-x", panelTitle: "x", projectContext: context }).includes("PROJECT / MILESTONE CONTEXT"));
+  assert.ok(buildJudgePrompt({ originalRequest: "request", contract, report: {}, diff: "", gateSummary: "PASS", taskId: "task-x", risk: "low", iteration: 1, expectedVersion: 1, projectContext: context }).includes("MILESTONE: M1"));
+  assert.ok(buildSpecUpdatePrompt({ previousVersion: 1, contract, revision: { version: 2, changed: [], reason: [], evidence: [], user_intent_changed: false }, delta: { matched: [], missing: [], incorrect: [], unexpected: [], required_changes: [], must_preserve: [] }, originalRequest: "request", repoPath: "/repo", taskId: "task-x", projectContext: context }).includes("MILESTONE: M1"));
+  assert.ok(buildExecutorCheckpoint({ taskId: "task-x", originalRequest: "request", expectedVersion: 1, contract, iteration: 1, report: { implementation: [], tests: {}, unresolved: [] }, delta: null, gateSummary: "PASS", projectContext: context }).includes("project-x/M1"));
+  assert.ok(buildRecoveryPrompt({ taskId: "task-x", originalRequest: "request", contract, checkpoint: "x", repoPath: "/repo", delta: null, projectContext: context }).includes("MILESTONE: M1"));
+});
+
+test("PM protocol correlates the latest fenced response and uses a read-only launch", () => {
+  assert.deepEqual(productManagerPiArgs("default"), ["--no-extensions", "--tools", "read,grep,find,ls"]);
+  const args = productManagerPiArgs("provider/pm");
+  assert.deepEqual(args.slice(0, 2), ["--model", "provider/pm"]);
+  assert.ok(args.includes("read,grep,find,ls"));
+  assert.ok(!args.join(" ").match(/\b(bash|edit|write)\b/));
+  const stale = "```yaml\nprotocol_version: 1\nrequest_id: pm-x-2\nkind: plan\ngoal: stale\n```\n```yaml\nprotocol_version: 1\nrequest_id: pm-x-2\nkind: plan\ngoal: current\n```";
+  assert.ok(extractCorrelatedYamlBlock(stale, "pm-x-2")?.includes("current"));
+  assert.equal(extractCorrelatedYamlBlock(stale, "pm-x-3"), null);
+  const prompt = buildProductManagerPlanPrompt({ sourceRequest: "x", repoPath: "/repo", requestId: "pm-x-2" });
+  const response = `\`\`\`yaml\nprotocol_version: 1\nrequest_id: pm-x-2\nkind: plan\n${projectYaml}\`\`\``;
+  assert.ok(prompt.includes("never implement"));
+  assert.ok(!prompt.includes("```yaml\nprotocol_version: 1\nrequest_id: pm-x-2"));
+  assert.equal(parseProjectPlan(extractCorrelatedYamlBlock(`${prompt}\n${response}`, "pm-x-2", "plan")!).goal, "Ship project flow");
+});
+
+test("PM feedback and acceptance require matching protocol responses", () => {
+  const feedback = "```yaml\nprotocol_version: 1\nrequest_id: pm-x-3\nkind: milestone_feedback\nmilestone_id: M1\ntask_id: task-1\ndecision: acknowledged\nsummary: reviewed\nunresolved: []\ndeviations: []\nreason: aligned\n```";
+  assert.equal(parseProductMilestoneFeedback(feedback, "pm-x-3")?.decision, "acknowledged");
+  const feedbackPrompt = buildMilestoneCompletionFeedbackPrompt({ protocol_version: 1, request_id: "pm-x-3", kind: "milestone_feedback", milestone_id: "M1", task_id: "task-1", executor_summary: "done", judge: { verdict: "converged", gaps: [] }, gate_summary: "PASS", unresolved: [], deviations: [] });
+  assert.ok(!feedbackPrompt.includes("```yaml\nprotocol_version: 1\nrequest_id: pm-x-3"));
+  assert.equal(parseProductMilestoneFeedback(`${feedbackPrompt}\n${feedback}`, "pm-x-3")?.summary, "reviewed");
+  assert.equal(parseProductMilestoneFeedback(feedback, "pm-x-4"), null);
+  assert.equal(parseProductMilestoneFeedback("```yaml\nprotocol_version: 1\nrequest_id: pm-x-3\nkind: milestone_feedback\ndecision: maybe\n```", "pm-x-3"), null);
+  const final = "```yaml\nprotocol_version: 1\nrequest_id: pm-x-4\nkind: final_acceptance\nverdict: accepted\nsummary: done\nsatisfied: []\ngaps: []\nunresolved: []\nreason: verified\n```";
+  assert.equal(parseProjectAcceptance(final, "pm-x-4")?.verdict, "accepted");
+  const acceptancePrompt = buildProductAcceptancePrompt({ requestId: "pm-x-4", plan: parseProjectPlan(projectYaml), milestones: [], diff: "", gateSummary: "PASS" });
+  assert.ok(!acceptancePrompt.includes("```yaml\nprotocol_version: 1\nrequest_id: pm-x-4"));
+  assert.equal(parseProjectAcceptance(`${acceptancePrompt}\n${final}`, "pm-x-4")?.verdict, "accepted");
+  assert.equal(parseProjectAcceptance(final, "pm-x-5"), null);
+  const recovery = buildProductManagerRecoveryPrompt({ projectId: "project-x", requestId: "pm-x-4", outstandingRequest: { kind: "final_acceptance" }, persistedFeedback: [] });
+  assert.ok(recovery.includes("pm-x-4"));
+  assert.ok(!recovery.toLowerCase().includes("write source"));
+  assert.ok(buildMilestoneCompletionFeedbackPrompt({ protocol_version: 1, request_id: "pm-x-3", kind: "milestone_feedback", milestone_id: "M1", task_id: "task-1", executor_summary: "done", judge: { verdict: "converged", gaps: [] }, gate_summary: "PASS", unresolved: [], deviations: [] }).includes("acknowledged|blocked"));
+  assert.ok(buildProductAcceptancePrompt({ requestId: "pm-x-4", plan: parseProjectPlan(projectYaml), milestones: [], diff: "", gateSummary: "PASS" }).includes("read-only"));
+});
+
+test("project lifecycle only treats nonterminal states as active", () => {
+  for (const status of ["PLANNING", "AWAITING_APPROVAL", "RUNNING", "ACCEPTING"] as const) assert.ok(isActiveProjectState(status));
+  for (const status of ["ACCEPTED", "REJECTED", "BLOCKED", "FAILED", "CANCELLED"] as const) assert.ok(!isActiveProjectState(status));
+  assert.ok(isProjectFinalizationStopped("CANCELLED", false));
+  assert.ok(isProjectFinalizationStopped("ACCEPTING", true));
+  assert.ok(!isProjectFinalizationStopped("ACCEPTING", false));
+});
+
+test("project acceptance parser and guards reject incomplete, unresolved, or failed gate", () => {
+  const accepted = parseProjectAcceptance("```yaml\nverdict: accepted\nsummary: done\nsatisfied:\n  - all\ngaps: []\nunresolved: []\nreason: verified\n```");
+  const acceptedWithGaps = parseProjectAcceptance("verdict: accepted\nsummary: done\nsatisfied: []\ngaps:\n  - missing requirement\nunresolved: []\nreason: contradictory");
+  const acceptedWithUnresolved = parseProjectAcceptance("verdict: accepted\nsummary: done\nsatisfied: []\ngaps: []\nunresolved:\n  - pending investigation\nreason: contradictory");
+  assert.equal(accepted?.verdict, "accepted");
+  assert.equal(parseProjectAcceptance("verdict: nope"), null);
+  assert.equal(parseProjectAcceptance("verdict: blocked\nsummary: stop\nsatisfied: []\ngaps: []\nunresolved: []\nreason: x")?.verdict, "blocked");
+  const milestones: any = { M1: { status: "CONVERGED", verdict: "converged", unresolved: [] } };
+  assert.ok(canAcceptProject({ orderedMilestoneIds: ["M1"], milestones, finalGatePassed: true, productAcceptance: accepted, acceptance: accepted }));
+  assert.ok(!canAcceptProject({ orderedMilestoneIds: ["M1"], milestones, finalGatePassed: true, productAcceptance: acceptedWithGaps, acceptance: accepted }));
+  assert.ok(!canAcceptProject({ orderedMilestoneIds: ["M1"], milestones, finalGatePassed: true, productAcceptance: accepted, acceptance: acceptedWithGaps }));
+  assert.ok(!canAcceptProject({ orderedMilestoneIds: ["M1"], milestones, finalGatePassed: true, productAcceptance: accepted, acceptance: acceptedWithUnresolved }));
+  milestones.M1.unresolved = ["x"]; assert.ok(!canAcceptProject({ orderedMilestoneIds: ["M1"], milestones, finalGatePassed: true, productAcceptance: accepted, acceptance: accepted }));
+  milestones.M1.unresolved = []; assert.ok(!canAcceptProject({ orderedMilestoneIds: ["M1"], milestones, finalGatePassed: false, productAcceptance: accepted, acceptance: accepted }));
+  assert.ok(buildProjectAcceptancePrompt({ plan: parseProjectPlan(projectYaml), milestones: [], diff: "", gateSummary: "PASS", productAcceptance: accepted! }).includes("never bypasses Controller"));
 });
 
 // ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 > **English** → [README.md](README.md) · English version available here.
 
-双模型开发工作流：**Astra（主 Pi）做 Controller/Judge**，**DeepSeek 在独立可见 Herdr Pane 中做 Executor**，中间有 **Deterministic Gate**，核心是 **Expected ↔ Actual 收敛闭环**。
+普通任务保持双角色闭环；项目模式为明确的**三 pane 架构**：**Astra（主 Pi）仍做 Controller/Judge**，持久、只读的 **Product Manager** 使用独立可见 Herdr pane，每个里程碑由 **DeepSeek Executor** 执行；Deterministic Gate 仍位于实现和判断之间。
 
 ```
 USER
@@ -89,18 +89,22 @@ cp -r extension ~/.pi/agent/extensions/dual-gate/
 | Controller / Judge | `openai-codex/gpt-5.6-sol` | GPT-5.6 Sol，经 ChatGPT 订阅后端（`opencode/*` 无 auth，不可用） |
 | Controller thinking | `medium` | 模型支持映射到 medium |
 | Executor | `new-api/deepseek-v4-flash` | DeepSeek V4 Flash（本地网关，有 auth） |
+| Product Manager | `default` | 仅项目模式；跟随主 Pi，使用只读 Herdr pane |
 
-可随时切换：`/dual controller [id]`、`/dual executor [id]`、`/dual thinking [level]`。
+可随时切换：`/dual controller [id]`、`/dual executor [id]`、`/dual product-manager [id|default]`、`/dual thinking [level]`。
 
 ## 命令
 
 | 命令 | 作用 |
 |---|---|
 | `/dual on` / `/dual off` | 开启/关闭。OFF 完全恢复普通 Pi |
-| `/dual status` | 状态：模型、Herdr、Task、State、Iteration、Spec 版本、Pane、Session 存活 |
+| `/dual status` | 状态：模型、Herdr、Task、State、Iteration、Spec 版本、Pane、Session 存活及当前项目进度 |
+| `/dual project <request>` | 生成项目 WBS，展示并显式确认后，按依赖串行执行里程碑 |
+| `/dual project status` | 显示当前项目的里程碑/最终验收进度 |
 | `/dual models` | 查看当前模型配置 |
 | `/dual controller [id]` | 选择 Controller/Judge 模型（无参数弹 selector） |
 | `/dual executor [id]` | 选择 Executor 模型（无参数弹 selector） |
+| `/dual product-manager [id\|default]` | 选择仅项目模式、只读的 PM 模型 |
 | `/dual thinking [level]` | thinking: minimal/low/medium/high/xhigh/max |
 | `/dual cancel` | 取消当前任务：停止编排、保留 pane（重命名 `· CANCELLED`）、不删代码不 reset git |
 | `/dual bypass` | 下一条用户任务走普通 Pi，之后恢复 Dual-Gate |
@@ -113,6 +117,7 @@ cp -r extension ~/.pi/agent/extensions/dual-gate/
   "enabled": false,   // 默认关闭；/dual on 后持久化为 true
   "controller": { "model": "openai-codex/gpt-5.6-sol", "thinking": "medium" },
   "executor": { "model": "new-api/deepseek-v4-flash" },
+  "product_manager": { "model": "default" },
   "runtime": { "herdr": "required" },
   "gate": { "enabled": true, "max_retries": 3, "timeoutMs": 300000 },
   "judge": { "max_retries": 2 },
@@ -123,6 +128,12 @@ cp -r extension ~/.pi/agent/extensions/dual-gate/
   "ui": { "show_widget": true }
 }
 ```
+
+## 项目模式（三 pane）
+
+`/dual project <request>` 是显式入口；普通输入仍走原有单任务闭环。项目开始前会创建持久、可见的 **PM** Herdr pane，与主 Controller/Judge pane 和当前里程碑 Executor pane 并存。PM 只读（`read,grep,find,ls`，无 shell 或写入工具），只通过持久项目产物提交 WBS；主 Pi 校验、展示并让用户显式批准，且始终独占里程碑契约、任务规划/控制、Gate、Judge、持久化和取消权。
+
+每个里程碑仍复用 Executor → Gate → Judge 闭环；其任务收敛并持久化后，主 Pi 向同一个 PM 发送有界、持久化的完成交接。PM 返回 `blocked` 会停止项目；PM 响应畸形、超时或会话丢失会 fail closed。全部里程碑后，主 Pi 先跑最终 Gate，再取得强制的 PM 产品验收，最后进行 Controller 独立 ratification。只有 PM 与 Controller 都 `accepted` 且无 gaps/unresolved、最终 Gate 通过、所有里程碑无 unresolved 地收敛，项目才会 `ACCEPTED`。默认保留 PM pane 供检查；`panel.on_complete: close` 或 `/dual cleanup` 才关闭。
 
 ## Artifacts（每个任务）
 
@@ -144,6 +155,25 @@ cp -r extension ~/.pi/agent/extensions/dual-gate/
 ```
 
 不保存模型 private CoT；只保存 Expected / Actual / Delta / Gate / State。
+
+## 项目产物
+
+```
+.pi/dual-gate/projects/<project-id>/
+├── project-plan.yaml
+├── project-state.json / project-approval.json
+├── product-manager/
+│   ├── metadata.json / plan-request.json / plan-response-raw.md
+│   ├── milestone-<M>-request.json / milestone-<M>-feedback.yaml
+│   └── final-acceptance-request.json / product-acceptance.yaml
+├── controller-ratification.yaml
+├── milestones/<M-id>/milestone.yaml
+├── milestones/<M-id>/state.json / task-ref.json
+├── final-gate-discovery.json / final-gate.log
+└── project-acceptance-report.md（PM 输入 + Controller ratification）
+```
+
+里程碑的标准任务产物仍在 `.pi/dual-gate/<task-id>/`；`task-ref.json` 只链接它们，不改变恢复或 worktree 行为。
 
 ## 状态机
 
@@ -182,10 +212,10 @@ IDLE → PLANNING → SPAWNING_EXECUTOR → EXECUTING → GATING
 
 ```bash
 cd /home/max/dual-gate
-node --experimental-strip-types tests/core.test.ts   # 45 passed
+node --experimental-strip-types tests/core.test.ts
 ```
 
-覆盖：config 默认/规范化/非法值、task id/标题/agent 名、状态机转移、收敛跟踪、风险检测、YAML/Execution Report/Judge 解析（converged/implementation_gap/spec_gap/blocked）、contract/spec-revision/diagnosis 解析、prompt 构建（initial/delta-fix/judge）、artifact store、gate 发现（node/python/go/无命令）、gate 运行（pass/fail）。
+覆盖：config 默认/规范化/非法值、模型解析与 PM 的严格可用/已认证模型校验、task id/标题/agent 名、状态机转移、收敛跟踪、风险检测、YAML/Execution Report/Judge 解析（converged/implementation_gap/spec_gap/blocked）、contract/spec-revision/diagnosis 解析、prompt 构建（initial/delta-fix/judge）、项目 WBS/依赖排序/里程碑契约、PM 只读启动参数及计划/交接反馈/最终产品验收的 prompt+response IPC 关联、artifact store、gate 发现（node/python/go/无命令）、gate 运行（pass/fail）。
 
 ## 端到端验证记录（真实运行）
 

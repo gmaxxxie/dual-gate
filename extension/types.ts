@@ -36,6 +36,8 @@ export interface DgConfig {
   enabled: boolean;
   controller: { model: string; thinking: ThinkingLevel };
   executor: { model: string };
+  /** Project-only, read-only PM pane. `default` follows the parent Pi model. */
+  product_manager: { model: string };
   runtime: { herdr: "required" };
   gate: { enabled: boolean; max_retries: number; timeoutMs: number };
   judge: { max_retries: number };
@@ -125,6 +127,112 @@ export interface GateStep {
   exitCode: number | null;
   outputTail: string;
   durationMs: number;
+}
+
+export type ProjectState = "PLANNING" | "AWAITING_APPROVAL" | "RUNNING" | "ACCEPTING" | "ACCEPTED" | "REJECTED" | "BLOCKED" | "FAILED" | "CANCELLED";
+export type ProjectAcceptanceVerdict = "accepted" | "gaps" | "blocked";
+
+export interface Milestone {
+  id: string;
+  title: string;
+  depends_on: string[];
+  scope: { files: string[]; components: string[] };
+  expected_outcome: string[];
+  acceptance_criteria: string[];
+  validation: { required: string[] };
+  risk: { level: RiskLevel; concerns: string[] };
+}
+
+export interface ProjectPlan {
+  version: number;
+  goal: string;
+  context: string;
+  constraints: string[];
+  acceptance_criteria: string[];
+  validation: { required: string[] };
+  milestones: Milestone[];
+}
+
+export interface ProjectMilestoneContext {
+  projectId: string;
+  projectGoal: string;
+  milestoneId: string;
+  milestoneTitle: string;
+  scope: Milestone["scope"];
+  dependsOn: string[];
+  completedSummaries: Array<{ milestoneId: string; title: string; summary: string; verdict: JudgeVerdict }>;
+}
+
+export interface ProjectMilestoneRecord {
+  title?: string;
+  status: "PENDING" | "RUNNING" | "CONVERGED" | "BLOCKED" | "FAILED" | "CANCELLED";
+  taskId?: string;
+  taskArtifactDir?: string;
+  summary?: string;
+  verdict?: JudgeVerdict;
+  unresolved?: string[];
+  deviations?: string[];
+  completedAt?: string;
+}
+
+export type ProductManagerState = "STARTING" | "ACTIVE" | "WAITING" | "RECOVERING" | "FAILED" | "CANCELLED" | "DONE";
+
+export interface ProductManagerRecord {
+  model: string;
+  paneId?: string;
+  agentName?: string;
+  state: ProductManagerState;
+  recoveryCount: number;
+  lastRequestId?: string;
+  lastRequestKind?: "plan" | "milestone_feedback" | "final_acceptance";
+  error?: string;
+}
+
+/** Durable PM handoff input and response decision for one converged milestone. */
+export interface ProjectMilestoneFeedback {
+  protocol_version: 1;
+  request_id: string;
+  kind: "milestone_feedback";
+  milestone_id: string;
+  task_id: string;
+  executor_summary: string;
+  judge: { verdict: JudgeVerdict; gaps: string[] };
+  gate_summary: string;
+  unresolved: string[];
+  deviations: string[];
+  artifact_refs?: { taskArtifactDir: string; milestoneArtifactDir: string };
+  decision?: "acknowledged" | "blocked";
+  summary?: string;
+  reason?: string;
+}
+
+export interface ProjectRecord {
+  projectId: string;
+  sourceRequest: string;
+  repoPath: string;
+  artifactDir: string;
+  status: ProjectState;
+  orderedMilestoneIds: string[];
+  currentMilestoneId?: string;
+  milestones: Record<string, ProjectMilestoneRecord>;
+  createdAt: string;
+  updatedAt: string;
+  /** Persistent PM session for this project; absent in legacy project artifacts. */
+  productManager?: ProductManagerRecord;
+  /** Mandatory product-level verdict from the PM. */
+  productAcceptance?: ProjectAcceptance;
+  /** Controller ratification/result retained for Stage-1 artifact compatibility. */
+  finalAcceptance?: ProjectAcceptanceVerdict;
+  error?: string;
+}
+
+export interface ProjectAcceptance {
+  verdict: ProjectAcceptanceVerdict;
+  summary: string;
+  satisfied: string[];
+  gaps: string[];
+  unresolved: string[];
+  reason: string;
 }
 
 export interface TaskRecord {
