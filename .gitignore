@@ -1,0 +1,11 @@
+# Local runtime artifacts
+.pi/
+demo-repo/.git/
+demo-repo/node_modules/
+
+# Node
+node_modules/
+*.log
+
+# OS
+.DS_Store

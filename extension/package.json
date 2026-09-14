@@ -1,0 +1,12 @@
+{
+  "name": "dual-gate-orchestrator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pi + Herdr Dual-Gate Orchestrator: GPT Controller/Judge + Herdr DeepSeek Executor",
+  "type": "module",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-ai": "0.85.1",
+    "typebox": "^0.34.0"
+  }
+}
