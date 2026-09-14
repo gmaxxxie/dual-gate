@@ -9,7 +9,7 @@
 // with spec versioning and convergence detection.
 // =============================================================================
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, renameSync } from "node:fs";
 import { join, resolve, basename } from "node:path";
 import { homedir } from "node:os";
 import { execFile } from "node:child_process";
@@ -140,11 +140,13 @@ function makeRegistry(ctx: ExtensionContext): ModelRegistryAdapter {
   const registry = ctx.modelRegistry;
   const available = (): ModelRef[] => {
     try {
+      // ModelRegistry (pi-coding-agent) exposes getAll()/getAvailable()/find()/getProvider() —
+      // NOT getProviders(). Each Model carries provider/id/name directly.
+      // Use getAvailable() so only providers with configured auth are shown (avoids
+      // listing hundreds of catalogue models the user can't actually use).
       const out: ModelRef[] = [];
-      for (const p of registry.getProviders()) {
-        for (const m of p.getModels()) {
-          out.push({ provider: p.id, id: m.id, name: m.name ?? `${p.id}/${m.id}` });
-        }
+      for (const m of registry.getAvailable()) {
+        out.push({ provider: m.provider, id: m.id, name: m.name ?? `${m.provider}/${m.id}` });
       }
       return out;
     } catch {
@@ -156,7 +158,7 @@ function makeRegistry(ctx: ExtensionContext): ModelRegistryAdapter {
     if (!r) return null;
     if (r.provider) {
       try {
-        const m = registry.getModel(r.provider, r.id);
+        const m = registry.find(r.provider, r.id);
         if (m) return { provider: r.provider, id: r.id, name: m.name ?? spec };
       } catch { /* ignore */ }
       return { provider: r.provider, id: r.id, name: spec };
@@ -169,9 +171,9 @@ function makeRegistry(ctx: ExtensionContext): ModelRegistryAdapter {
   const clampThinking = (modelRef: ModelRef, level: ThinkingLevel): "off" | ThinkingLevel => {
     if (level === "off") return "off";
     try {
-      const m = modelRef.provider ? registry.getModel(modelRef.provider, modelRef.id) : null;
+      const m = modelRef.provider ? registry.find(modelRef.provider, modelRef.id) : undefined;
       if (m) {
-        const map = (m as any).thinkingLevelMap as Record<string, string | null> | undefined;
+        const map = m.thinkingLevelMap as Record<string, string | null> | undefined;
         if (map && typeof map === "object" && level in map) {
           return map[level] == null ? "off" : level;
         }
@@ -182,8 +184,8 @@ function makeRegistry(ctx: ExtensionContext): ModelRegistryAdapter {
   const hasAuth = (modelRef: ModelRef): boolean => {
     if (!modelRef.provider) return false;
     try {
-      const auth = registry.getProviderAuth(modelRef.provider);
-      return auth != null && (auth as any).configured !== false;
+      const status = registry.getProviderAuthStatus(modelRef.provider);
+      return status != null && status.configured === true;
     } catch {
       return false;
     }
@@ -203,7 +205,7 @@ async function completeText(
   opts: { thinking?: string } = {},
 ): Promise<string> {
   const registry = ctx.modelRegistry;
-  const model = modelRef.provider ? registry.getModel(modelRef.provider, modelRef.id) : registry.getModel(ctx.model!.provider, ctx.model!.id);
+  const model = modelRef.provider ? registry.find(modelRef.provider, modelRef.id) : ctx.model ? registry.find(ctx.model.provider, ctx.model.id) : undefined;
   if (!model) {
     throw new Error(`Model not found in registry: ${modelRef.provider}/${modelRef.id}`);
   }
@@ -235,9 +237,45 @@ function loadConfig(): ReturnType<typeof normalizeConfig> {
   return normalizeConfig(null);
 }
 
-function saveConfig(config: ReturnType<typeof normalizeConfig>): void {
+/**
+ * Persist a minimal patch to the global config file (single source of truth
+ * across sessions, projects and Pi restarts).
+ *
+ * Field-level merge: we re-read the on-disk config, apply ONLY the fields in
+ * `patch`, then atomic-write. This keeps concurrent Pi instances from
+ * clobbering each other: each window only writes the fields its user changed,
+ * preserving everything else (including another window's changes).
+ */
+function saveConfig(patch: Partial<ReturnType<typeof normalizeConfig>>): void {
   try {
-    writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
+    let base: ReturnType<typeof normalizeConfig> = normalizeConfig(null);
+    try {
+      if (existsSync(CONFIG_PATH)) {
+        const onDisk = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Partial<ReturnType<typeof normalizeConfig>>;
+        base = normalizeConfig(onDisk);
+      }
+    } catch { /* start from defaults if disk read fails */ }
+
+    // Apply patch field-by-field (deep-merge for nested objects).
+    const merged = normalizeConfig({ ...base, ...patch });
+    if (patch.controller && typeof patch.controller === "object") {
+      merged.controller = {
+        ...(base.controller ?? {}),
+        ...(patch.controller as Partial<typeof base.controller>),
+      } as typeof base.controller;
+    }
+    if (patch.executor && typeof patch.executor === "object") {
+      merged.executor = {
+        ...(base.executor ?? {}),
+        ...(patch.executor as Partial<typeof base.executor>),
+      } as typeof base.executor;
+    }
+
+    // Atomic write: write temp file then rename, so a crash mid-write can't
+    // corrupt the persisted config.
+    const tmp = `${CONFIG_PATH}.tmp`;
+    writeFileSync(tmp, JSON.stringify(merged, null, 2) + "\n", "utf8");
+    renameSync(tmp, CONFIG_PATH);
   } catch (e) {
     console.error("[dual-gate] failed to persist config:", errMsg(e));
   }
@@ -453,12 +491,10 @@ function updateWidget(ctx: ExtensionContext): void {
     const rt = getRuntime();
     const task = rt.manager.active();
     const config = rt.config;
-    if (!config.ui.show_widget) {
+    // When Dual-Gate is OFF, it must be invisible in the UI (footer/widget) —
+    // OFF fully restores normal Pi (see README: "does not affect normal Pi at all").
+    if (!config.enabled || !config.ui.show_widget) {
       ctx.ui.setWidget("dual-gate", undefined);
-      return;
-    }
-    if (!config.enabled) {
-      ctx.ui.setWidget("dual-gate", [ctx.ui.theme.fg("muted", "dual-gate: off")]);
       return;
     }
     if (!task) {
@@ -481,20 +517,99 @@ function updateWidget(ctx: ExtensionContext): void {
 
 function setStatus(ctx: ExtensionContext, label: string | undefined): void {
   try {
+    // When Dual-Gate is OFF it must leave no trace in the footer/status line.
+    if (!getRuntime().config.enabled) {
+      ctx.ui.setStatus("dual-gate", undefined);
+      return;
+    }
     ctx.ui.setStatus("dual-gate", label);
   } catch { /* ignore */ }
 }
 
 // ---------------------------------------------------------------------------
-// Model picker
+// Model picker (fuzzy search + role-aware ordering)
 // ---------------------------------------------------------------------------
 
-async function pickModel(ctx: ExtensionContext, registry: ModelRegistryAdapter, title: string): Promise<ModelRef | null> {
-  const models = registry.available();
+/**
+ * Score a model for a given role. Controller/Judge prefers GPT-official
+ * (openai-codex) first; Executor prefers DeepSeek first.
+ */
+function modelRoleOrder(m: ModelRef, role: "controller" | "executor"): number {
+  const prov = m.provider.toLowerCase();
+  const id = m.id.toLowerCase();
+  const isGpt = prov.includes("openai") || prov.includes("codex") || id.startsWith("gpt");
+  const isDeepSeek = prov.includes("deepseek") || id.includes("deepseek");
+  if (role === "controller") {
+    if (prov === "openai-codex") return 0; // GPT official first
+    if (isGpt) return 1;
+    if (isDeepSeek) return 3;
+    return 2;
+  }
+  // executor: DeepSeek first, then gateway deepseek, then others
+  if (prov === "deepseek") return 0; // DeepSeek official first
+  if (isDeepSeek) return 1;
+  if (prov === "openai-codex" || isGpt) return 3;
+  return 2;
+}
+
+/** Match against provider, id and display name.
+ *  Scoring-aware: full substring match ranks first, then word-prefix,
+ *  then loose subsequence (fuzzy). Avoids "deep" matching "gpt" via
+ *  cross-word character scavenging. */
+function modelMatches(m: ModelRef, query: string): boolean {
+  const q = query.toLowerCase().trim();
+  if (!q) return true;
+  const prov = m.provider.toLowerCase();
+  const id = m.id.toLowerCase();
+  const name = m.name.toLowerCase();
+  // 1) exact substring in any field
+  if (prov.includes(q) || id.includes(q) || name.includes(q)) return true;
+  // 2) all query words present as substrings somewhere
+  const words = q.split(/\s+/).filter(Boolean);
+  if (words.every((w) => prov.includes(w) || id.includes(w) || name.includes(w))) return true;
+  // 3) loose fuzzy: each query char in order, but only within a single token
+  //    (prevents cross-word matches like "deep" → "gpt")
+  const tokens = [prov, ...id.split(/[-.\/]/), ...name.split(/[\s()-]+/)];
+  for (const tok of tokens) {
+    let pos = 0;
+    let ok = true;
+    for (const ch of q) {
+      pos = tok.indexOf(ch, pos);
+      if (pos === -1) {
+        ok = false;
+        break;
+      }
+      pos += 1;
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
+async function pickModel(ctx: ExtensionContext, registry: ModelRegistryAdapter, title: string, role: "controller" | "executor" = "controller"): Promise<ModelRef | null> {
+  let models = registry.available();
   if (models.length === 0) {
     ctx.ui.notify("No models available in registry", "warning");
     return null;
   }
+  // Search first: user types a fuzzy keyword (e.g. "gpt", "deepseek", "sol"),
+  // then picks from the filtered list. Empty = show all (sorted by role).
+  const query = await ctx.ui.input(`${title} — 输入关键字模糊搜索（如 gpt/deepseek/5.6，直接回车看全部）:`, "");
+  const q = (query ?? "").trim();
+  if (q && q !== "*") {
+    models = models.filter((m) => modelMatches(m, q));
+    if (models.length === 0) {
+      ctx.ui.notify(`No models match "${q}"`, "warning");
+      // fall back to full list
+      models = registry.available();
+    }
+  }
+  // Sort by role preference, then by provider/id.
+  models.sort((a, b) => {
+    const r = modelRoleOrder(a, role) - modelRoleOrder(b, role);
+    if (r !== 0) return r;
+    return `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`);
+  });
   const labels = models.map((m) => `${m.provider}/${m.id}${m.name && m.name !== `${m.provider}/${m.id}` ? ` — ${m.name}` : ""}`);
   const chosen = await ctx.ui.select(title, labels);
   if (!chosen) return null;
@@ -1538,7 +1653,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
       switch (sub) {
         case "on": {
           rt.config.enabled = true;
-          saveConfig(rt.config);
+          saveConfig({ enabled: true });
           const ctl = resolveModelString(rt.config.controller.model);
           const exe = resolveModelString(rt.config.executor.model);
           ctx.ui.notify("Dual-Gate enabled", "success");
@@ -1555,8 +1670,10 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
         }
         case "off": {
           rt.config.enabled = false;
-          saveConfig(rt.config);
+          saveConfig({ enabled: false });
           ctx.ui.notify("Dual-Gate disabled — normal Pi", "info");
+          // Clear any stale footer status + widget: OFF must be fully invisible.
+          setStatus(ctx, undefined);
           updateWidget(ctx);
           break;
         }
@@ -1640,6 +1757,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
       lines.push(`Thinking     ${config.controller.thinking}`);
       lines.push(`Executor     ${exe?.id ?? "?"}`);
       lines.push("Herdr        " + (herdrOk ? "Ready" : "NOT DETECTED"));
+      lines.push(`Config       ${CONFIG_PATH} (跨 session/项目持久化)`);
       if (task) {
         const s = stateOf(task);
         const paneName = task.herdrPanelId
@@ -1684,6 +1802,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
         "",
         "Set with:  /dual controller [id]   /dual executor [id]   /dual thinking [level]",
         "Available models come from the current Pi registry (ctx.modelRegistry).",
+        `Persisted to: ${CONFIG_PATH} (跨 session/项目生效)`,
       ].join("\n"),
     );
   }
@@ -1697,15 +1816,15 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
         return;
       }
       rt.config.controller.model = `${ref.provider}/${ref.id}`;
-      saveConfig(rt.config);
-      ctx.ui.notify(`Controller → ${ref.id}`, "success");
+      saveConfig({ controller: { model: rt.config.controller.model } });
+      ctx.ui.notify(`Controller → ${ref.id}（已保存，跨 session/项目生效）`, "success");
       return;
     }
-    const picked = await pickModel(ctx, makeRegistry(ctx), "Controller / Judge model:");
+    const picked = await pickModel(ctx, makeRegistry(ctx), "Controller / Judge model:", "controller");
     if (picked) {
       rt.config.controller.model = `${picked.provider}/${picked.id}`;
-      saveConfig(rt.config);
-      ctx.ui.notify(`Controller → ${picked.id}`, "success");
+      saveConfig({ controller: { model: rt.config.controller.model } });
+      ctx.ui.notify(`Controller → ${picked.id}（已保存，跨 session/项目生效）`, "success");
     }
   }
 
@@ -1718,15 +1837,15 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
         return;
       }
       rt.config.executor.model = `${ref.provider}/${ref.id}`;
-      saveConfig(rt.config);
-      ctx.ui.notify(`Executor → ${ref.id}`, "success");
+      saveConfig({ executor: { model: rt.config.executor.model } });
+      ctx.ui.notify(`Executor → ${ref.id}（已保存，跨 session/项目生效）`, "success");
       return;
     }
-    const picked = await pickModel(ctx, makeRegistry(ctx), "Executor model:");
+    const picked = await pickModel(ctx, makeRegistry(ctx), "Executor model:", "executor");
     if (picked) {
       rt.config.executor.model = `${picked.provider}/${picked.id}`;
-      saveConfig(rt.config);
-      ctx.ui.notify(`Executor → ${picked.id}`, "success");
+      saveConfig({ executor: { model: rt.config.executor.model } });
+      ctx.ui.notify(`Executor → ${picked.id}（已保存，跨 session/项目生效）`, "success");
     }
   }
 
@@ -1738,7 +1857,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
         return;
       }
       rt.config.controller.thinking = level as ThinkingLevel;
-      saveConfig(rt.config);
+      saveConfig({ controller: { thinking: rt.config.controller.thinking } });
       ctx.ui.notify(`Thinking → ${level}`, "success");
       return;
     }
@@ -1755,7 +1874,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
       const picked = levels.find((l) => l.label === chosen);
       if (picked) {
         rt.config.controller.thinking = picked.value;
-        saveConfig(rt.config);
+        saveConfig({ controller: { thinking: picked.value } });
         ctx.ui.notify(`Thinking → ${picked.value}`, "success");
       }
     }
