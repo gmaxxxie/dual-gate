@@ -1,0 +1,24 @@
+{
+  "name": "dual-gate-orchestrator",
+  "version": "1.0.0",
+  "description": "Pi + Herdr Dual-Gate Orchestrator: GPT Controller/Judge (Expected Outcome) + DeepSeek Executor in a visible Herdr pane + Deterministic Gate + Expected↔Actual convergence loop.",
+  "keywords": [
+    "pi-package",
+    "dual-gate",
+    "herdr",
+    "orchestrator",
+    "deepseek"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./extension/index.ts"
+    ]
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-ai": "0.85.1",
+    "typebox": "^0.34.0"
+  }
+}

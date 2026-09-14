@@ -67,7 +67,7 @@ function test(name: string, fn: () => void | Promise<void>): void {
 
 test("config defaults", () => {
   const c = normalizeConfig(null);
-  assert.equal(c.enabled, true);
+  assert.equal(c.enabled, false);  // default OFF — user opts in with /dual on
   assert.equal(c.controller.model, "openai-codex/gpt-5.6-sol");
   assert.equal(c.controller.thinking, "medium");
   assert.equal(c.executor.model, "new-api/deepseek-v4-flash");

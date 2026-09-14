@@ -39,13 +39,31 @@ Astra Compare  Expected ↔ Actual
 
 ## 安装
 
-```bash
-# 1. 将扩展放入 Pi 全局扩展目录
-cp -r /home/max/dual-gate/extension ~/.pi/agent/extensions/dual-gate/
-#    实际位置： ~/.pi/agent/extensions/dual-gate.ts  （单文件入口，依赖同目录 core.ts / gate.ts / types.ts）
+**默认关闭**：安装后 Dual-Gate 处于 OFF，完全不影响普通 Pi；用 `/dual on` 手动开启，`/dual off` 关闭。
 
-# 2. 配置（首次会自动生成默认值，也可手动创建）
-#    ~/.pi/agent/dual-gate.json
+### 方式 A：从 GitHub 安装（推荐，跨设备）
+
+```bash
+pi install git:github.com/gmaxxxie/dual-gate
+# 或指定版本
+pi install git:github.com/gmaxxxie/dual-gate@v1.0.0
+# 临时试用（不写入配置）
+pi -e git:github.com/gmaxxxie/dual-gate
+```
+
+### 方式 B：本地安装
+
+```bash
+bash install.sh
+# 或手动
+cp -r extension ~/.pi/agent/extensions/dual-gate/
+```
+
+安装后 **重启 Pi 或 `/reload`** 使扩展生效，然后：
+
+```bash
+/dual on      # 开启（默认关闭）
+/dual status  # 确认
 ```
 
 > 扩展依赖 `@earendil-works/pi-coding-agent` / `@earendil-works/pi-ai` / `typebox`，这些在 Pi 运行时已内置（`npm:` 包已装在 Pi 的 node_modules），无需额外 npm install。
@@ -90,7 +108,7 @@ cp -r /home/max/dual-gate/extension ~/.pi/agent/extensions/dual-gate/
 
 ```json
 {
-  "enabled": true,
+  "enabled": false,   // 默认关闭；/dual on 后持久化为 true
   "controller": { "model": "openai-codex/gpt-5.6-sol", "thinking": "medium" },
   "executor": { "model": "new-api/deepseek-v4-flash" },
   "runtime": { "herdr": "required" },

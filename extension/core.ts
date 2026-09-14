@@ -55,7 +55,7 @@ export function createArtifactStore(taskDir: string): ArtifactStore {
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_CONFIG: DgConfig = {
-  enabled: true,
+  enabled: false,
   controller: { model: "openai-codex/gpt-5.6-sol", thinking: "medium" },
   executor: { model: "new-api/deepseek-v4-flash" },
   runtime: { herdr: "required" },
