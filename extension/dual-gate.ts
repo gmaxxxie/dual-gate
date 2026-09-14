@@ -209,11 +209,35 @@ async function completeText(
   if (!model) {
     throw new Error(`Model not found in registry: ${modelRef.provider}/${modelRef.id}`);
   }
+  // Calibrate the requested thinking level against THIS model's thinkingLevelMap:
+  // a level the model doesn't support (e.g. "high" on gpt-5.6-sol) would make
+  // registry.complete() throw. Pick the supported level nearest to the request
+  // (same distance → prefer the lower one, so we never silently spend more
+  // than the user asked for).
+  let reasoning = opts.thinking ?? "medium";
+  const map = (model as { thinkingLevelMap?: Record<string, string | null> }).thinkingLevelMap;
+  if (map && typeof map === "object" && Object.keys(map).length > 0) {
+    const levels = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+    const idx = levels.indexOf(reasoning as (typeof levels)[number]);
+    const supported = levels.filter((l) => map[l] != null);
+    if (supported.length > 0 && !supported.includes(reasoning as (typeof levels)[number])) {
+      let best = supported[0];
+      let bestDist = Number.MAX_SAFE_INTEGER;
+      for (const l of supported) {
+        const dist = Math.abs(levels.indexOf(l) - idx);
+        if (dist < bestDist || (dist === bestDist && levels.indexOf(l) < levels.indexOf(best))) {
+          best = l;
+          bestDist = dist;
+        }
+      }
+      reasoning = best;
+    }
+  }
   const messages: Message[] = [{ role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() }];
   const response = await registry.complete(
     model,
     { systemPrompt, messages } as LlmContext,
-    { reasoning: (opts.thinking ?? "medium") as never } as never,
+    { reasoning: (reasoning ?? "medium") as never } as never,
   );
   const text = (response.content ?? [])
     .filter((c): c is { type: "text"; text: string } => c.type === "text")
