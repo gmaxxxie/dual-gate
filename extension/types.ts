@@ -15,6 +15,7 @@ export type TaskState =
   | "FIXING_IMPLEMENTATION"
   | "REVISING_SPEC"
   | "DIAGNOSING"
+  | "PAUSED"
   | "DONE"
   | "FAILED"
   | "CANCELLED"

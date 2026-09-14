@@ -82,6 +82,8 @@ interface DgRuntime {
   registry: ModelRegistryAdapter | null;
   running: boolean;
   stopRequested: boolean;
+  pauseRequested: boolean;
+  pendingResumeRequirement: string | undefined;
 }
 
 let runtime: DgRuntime | null = null;
@@ -533,6 +535,7 @@ function stateOf(task: TaskRecord): { symbol: string; label: string } {
     case "REVISING_SPEC": return { symbol: "✎", label: "Revising spec" };
     case "JUDGING": return { symbol: "○", label: "Comparing" };
     case "DIAGNOSING": return { symbol: "?", label: "Diagnosing" };
+    case "PAUSED": return { symbol: "❚❚", label: "Paused" };
     case "DONE": return { symbol: "✓", label: "Converged" };
     case "FAILED": return { symbol: "✗", label: "Failed" };
     case "CANCELLED": return { symbol: "—", label: "Cancelled" };
@@ -854,6 +857,31 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
       rt.manager.patch(task.taskId, { iteration, currentStage: `iteration-${iteration}` });
       writeState(task, store);
 
+      // ---- Pause checkpoint (user may pause at any point) ----
+      const pause = await pauseCheckpoint(ctx, task, config, store);
+      if (!pause.resumed) return; // cancelled/failed while paused
+      if (pause.newRequirement) {
+        // Re-analyze: merge the new requirement into the contract (spec v+1).
+        ctx.ui.notify("Dual-Gate: re-analyzing new requirement…", "info");
+        const revised = await reviseSpec(ctx, task, config, contract, {
+          verdict: "spec_gap",
+          confidence: "medium",
+          expected: contract.expected_outcome,
+          actual: [],
+          matched: [],
+          gaps: ["New requirement from user: " + pause.newRequirement],
+          implementation_changes: [],
+          spec_changes: ["Merge new requirement"],
+          delta: { matched: [], missing: [], incorrect: [], unexpected: [], required_changes: [], must_preserve: [] },
+          reason: "User requested a change during execution.",
+        }, report, store);
+        if (revised) {
+          contract = revised.contract;
+          rt.manager.patch(task.taskId, { expectedVersion: contract.version, specRevisions: (task.specRevisions ?? 0) + 1 });
+          writeState(task, store);
+        }
+      }
+
       // ---- Spawn executor (only on first iteration or spec revision) ----
       if (!executorActive) {
         await spawnExecutor(ctx, task, config);
@@ -882,6 +910,32 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
         writeState(task, store);
         ctx.ui.notify("Dual-Gate: executor timed out", "error");
         return;
+      }
+
+      // ---- Pause checkpoint after execution (user may inspect / re-analyze) ----
+      {
+        const pause = await pauseCheckpoint(ctx, task, config, store);
+        if (!pause.resumed) return;
+        if (pause.newRequirement) {
+          ctx.ui.notify("Dual-Gate: re-analyzing new requirement…", "info");
+          const revised = await reviseSpec(ctx, task, config, contract, {
+            verdict: "spec_gap",
+            confidence: "medium",
+            expected: contract.expected_outcome,
+            actual: [],
+            matched: [],
+            gaps: ["New requirement from user: " + pause.newRequirement],
+            implementation_changes: [],
+            spec_changes: ["Merge new requirement"],
+            delta: { matched: [], missing: [], incorrect: [], unexpected: [], required_changes: [], must_preserve: [] },
+            reason: "User requested a change during execution.",
+          }, report, store);
+          if (revised) {
+            contract = revised.contract;
+            rt.manager.patch(task.taskId, { expectedVersion: contract.version, specRevisions: (task.specRevisions ?? 0) + 1 });
+            writeState(task, store);
+          }
+        }
       }
 
       // ---- Read the execution report ----
@@ -1433,6 +1487,54 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * Pause checkpoint: if the user requested a pause, persist PAUSED state and
+ * block until resumed. Resume may carry a revised requirement: it is merged
+ * into the task for re-analysis instead of restarting.
+ */
+async function pauseCheckpoint(
+  ctx: ExtensionCommandContext,
+  task: TaskRecord,
+  config: ReturnType<typeof normalizeConfig>,
+  store: ArtifactStore,
+): Promise<{ resumed: boolean; newRequirement?: string }> {
+  const rt = getRuntime();
+  if (!rt.pauseRequested) return { resumed: true };
+  rt.pauseRequested = false;
+
+  // Snapshot where we paused so resume can return to the same stage.
+  const pausedStage = task.currentStage;
+  const pausedState = task.state;
+  rt.manager.patch(task.taskId, { state: "PAUSED", currentStage: "paused" });
+  writeState(task, store);
+  ctx.ui.notify("Dual-Gate: ⏸ paused (Executor kept alive, work preserved)", "warning");
+  setStatus(ctx, "dual-gate: paused");
+  updateWidget(ctx);
+
+  // Wait until the user resumes or cancels.
+  while (true) {
+    const t = rt.manager.get(task.taskId);
+    if (!t) return { resumed: false };
+    if (t.state === "CANCELLED" || t.state === "FAILED" || t.state === "ESCALATED") return { resumed: false };
+    if (t.state === "PAUSED") {
+      // still paused: check for a queued resume requirement
+      const pending = rt.pendingResumeRequirement;
+      if (pending !== undefined) {
+        rt.pendingResumeRequirement = undefined;
+        // restore to the state we were in before pausing (or EXECUTING default)
+        const backTo = pausedState && pausedState !== "PAUSED" ? pausedState : "EXECUTING";
+        rt.manager.patch(task.taskId, { state: backTo, currentStage: pausedStage ?? "executing" });
+        writeState(task, store);
+        ctx.ui.notify("Dual-Gate: ▶ resumed" + (pending ? " — re-analyzing new requirement" : ""), "info");
+        setStatus(ctx, "dual-gate: resumed");
+        updateWidget(ctx);
+        return { resumed: true, newRequirement: pending || undefined };
+      }
+    }
+    await sleep(500);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Gate
 // ---------------------------------------------------------------------------
@@ -1697,6 +1799,8 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     registry: null,
     running: false,
     stopRequested: false,
+    pauseRequested: false,
+    pendingResumeRequirement: undefined,
   };
 
   const rt = getRuntime();
@@ -1719,9 +1823,19 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
       return;
     }
 
+    // While paused, the user's text is a NEW REQUIREMENT for re-analysis:
+    // queue it and resume automatically (no /dual resume needed).
+    const active = rt.manager.active();
+    if (active && active.state === "PAUSED") {
+      rt.pendingResumeRequirement = text;
+      ctx.ui.notify("Dual-Gate: new requirement received — resuming for re-analysis", "info");
+      updateWidget(ctx);
+      return { action: "handled" };
+    }
+
     // A Dual-Gate task owns the next non-command input. Do not let the main
     // Pi model execute it in parallel with the Controller/Executor workflow.
-    if (rt.running || rt.manager.active()) return { action: "handled" };
+    if (rt.running || active) return { action: "handled" };
 
     if ((globalThis as any).__dg_handling_input) return { action: "handled" };
     (globalThis as any).__dg_handling_input = true;
@@ -1749,6 +1863,8 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     { name: "executor", label: "Executor", description: "Pick the Executor model" },
     { name: "thinking", label: "Thinking level", description: "Set Controller thinking level (minimal..max)" },
     { name: "cancel", label: "Cancel task", description: "Cancel the active task, keep the pane" },
+    { name: "pause", label: "Pause task", description: "Pause the active task (Executor kept alive)" },
+    { name: "resume", label: "Resume task", description: "Resume with optional new requirement" },
     { name: "bypass", label: "Bypass next", description: "Next prompt uses normal Pi, then Dual-Gate resumes" },
     { name: "cleanup", label: "Cleanup panes", description: "Close done Dual-Gate worker panes" },
     { name: "help", label: "Help", description: "Show the full command list" },
@@ -1845,6 +1961,34 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
           updateWidget(ctx);
           break;
         }
+        case "pause": {
+          const t = rt.manager.active();
+          if (!t) {
+            ctx.ui.notify("Dual-Gate: no active task", "info");
+            break;
+          }
+          rt.pauseRequested = true;
+          ctx.ui.notify("Dual-Gate: pause requested — will pause at next checkpoint", "info");
+          updateWidget(ctx);
+          break;
+        }
+        case "resume": {
+          const t = rt.manager.active();
+          if (!t) {
+            ctx.ui.notify("Dual-Gate: no active task", "info");
+            break;
+          }
+          if (t.state !== "PAUSED") {
+            ctx.ui.notify("Dual-Gate: task is not paused (use /dual pause first)", "info");
+            break;
+          }
+          // Optional: remainder of args becomes the new requirement text.
+          const newReq = rest.length ? rest.join(" ") : undefined;
+          rt.pendingResumeRequirement = newReq;
+          ctx.ui.notify(newReq ? "Dual-Gate: resume with new requirement — re-analyzing…" : "Dual-Gate: resume", "info");
+          updateWidget(ctx);
+          break;
+        }
         case "bypass": {
           rt.manager.setBypassNext(true);
           ctx.ui.notify("Dual-Gate: next prompt will use normal Pi (bypass)", "info");
@@ -1866,6 +2010,8 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
               "  /dual executor [id|default]  pick executor model (default = follow main Pi)",
               "  /dual thinking [level]     thinking level (minimal..max)",
               "  /dual cancel               cancel active task",
+              "  /dual pause                pause active task (Executor kept alive)",
+              "  /dual resume [需求说明]    resume; optional new requirement triggers re-analysis",
               "  /dual bypass               next prompt runs on normal Pi",
               "  /dual cleanup              close done worker panels",
             ].join("\n"),
