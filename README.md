@@ -1,6 +1,8 @@
 # Dual-Gate Orchestrator (Pi + Herdr)
 
-双模型开发工作流：**Astra（主 Pi）做 Controller/Judge**，**DeepSeek 在独立可见 Herdr Pane 中做 Executor**，中间有 **Deterministic Gate**，核心是 **Expected ↔ Actual 收敛闭环**。
+> **中文版** → [README.zh-CN.md](README.zh-CN.md) · Chinese version available here.
+
+A dual-model development workflow: **Astra (main Pi) acts as Controller/Judge**, **DeepSeek runs as Executor in a separate visible Herdr pane**, with a **Deterministic Gate** in between — the core is the **Expected ↔ Actual convergence loop**.
 
 ```
 USER
@@ -14,101 +16,101 @@ Herdr  ── split right 40% ──►  New Visible Pane  ◄── DeepSeek V4
  │                                (DS · <task>)
  │                                Explore → Implement → Debug → Test → Report
  ▼
-Deterministic Gate  (项目已有 test/lint/typecheck/build)
+Deterministic Gate  (existing project test/lint/typecheck/build)
  │
  ▼
 Astra Compare  Expected ↔ Actual
  │
  ├─ CONVERGED ───────────────► DONE
- ├─ IMPLEMENTATION_GAP ──────► Delta ──► resume 同一个 DeepSeek pane
- ├─ SPEC_GAP ────────────────► Expected V2 ──► SPEC UPDATE ──► resume 同一个 pane
- ├─ MIXED_GAP ───────────────► Expected V2 + Delta ──► resume 同一个 pane
- └─ BLOCKED ─────────────────► ESCALATE（询问用户）
+ ├─ IMPLEMENTATION_GAP ──────► Delta ──► resume the same DeepSeek pane
+ ├─ SPEC_GAP ────────────────► Expected V2 ──► SPEC UPDATE ──► resume the same pane
+ ├─ MIXED_GAP ───────────────► Expected V2 + Delta ──► resume the same pane
+ └─ BLOCKED ─────────────────► ESCALATE (ask the user)
 ```
 
-## 核心原则
+## Core Principles
 
-- **Astra 是唯一 Controller/Judge**，用户只与主 Pi 对话；DeepSeek 是后台 Executor。
-- **一个 Task = 一个持久 DeepSeek Session = 一个持久可见 Herdr Pane**。
-  任务内所有迭代（gate 失败、implementation gap、spec 修订、judge 反馈）全部 **resume 同一个 pane 的同一个 session**，只发增量 Delta / SPEC UPDATE，绝不每轮重启。
-- **Context 生命周期以 Task 为边界**：Task A 的 session 不会污染 Task B；新 Task 默认新 pane。
-- **Spec 可以修订，但 User Intent 不可自动改变**：`User Intent > Expected Outcome > Implementation`。
-  若用户核心目标无法满足 → `blocked` / ESCALATE，交给用户。
-- **收敛条件**：Gate PASS **且** Acceptance Criteria 满足 **且** Expected ≈ Actual（verdict=converged）**且** 无阻塞 unresolved。
-- **Token 策略**：昂贵智能做判断（GPT-5.6 Sol 只看 Spec/Report/Diff/Gate），便宜智能做执行（DeepSeek 全量探索 repo）；Gate 失败不调用 Judge。
+- **Astra is the only Controller/Judge**; the user talks only to the main Pi; DeepSeek is the background Executor.
+- **One Task = one persistent DeepSeek Session = one persistent visible Herdr pane.**
+  Every iteration within a task (gate failure, implementation gap, spec revision, judge feedback) **resumes the same pane / the same session**, sending only incremental Deltas / SPEC UPDATEs — never restarting from scratch.
+- **Context lifetime is bounded by the Task**: Task A's session never pollutes Task B; a new task gets a new pane by default.
+- **Spec may be revised, but User Intent can never be changed automatically**: `User Intent > Expected Outcome > Implementation`.
+  If the user's core goal cannot be met → `blocked` / ESCALATE, hand it back to the user.
+- **Convergence conditions**: Gate PASS **and** Acceptance Criteria met **and** Expected ≈ Actual (verdict=converged) **and** no blocking unresolved item.
+- **Token strategy**: expensive intelligence judges (GPT-5.6 Sol only reads Spec/Report/Diff/Gate), cheap intelligence executes (DeepSeek explores the full repo); gate failures do not call the Judge.
 
-## 安装
+## Installation
 
-**默认关闭**：安装后 Dual-Gate 处于 OFF，完全不影响普通 Pi；用 `/dual on` 手动开启，`/dual off` 关闭。
+**OFF by default**: after installing, Dual-Gate is OFF and does not affect normal Pi at all. Enable manually with `/dual on`, disable with `/dual off`.
 
-### 方式 A：从 GitHub 安装（推荐，跨设备）
+### Option A: Install from GitHub (recommended, cross-device)
 
 ```bash
 pi install git:github.com/gmaxxxie/dual-gate
-# 或指定版本
+# or pin a version
 pi install git:github.com/gmaxxxie/dual-gate@v1.0.0
-# 临时试用（不写入配置）
+# try temporarily (not persisted to config)
 pi -e git:github.com/gmaxxxie/dual-gate
 ```
 
-### 方式 B：本地安装
+### Option B: Local install
 
 ```bash
 bash install.sh
-# 或手动
+# or manually
 cp -r extension ~/.pi/agent/extensions/dual-gate/
 ```
 
-安装后 **重启 Pi 或 `/reload`** 使扩展生效，然后：
+After installing, **restart Pi or `/reload`** for the extension to take effect, then:
 
 ```bash
-/dual on      # 开启（默认关闭）
-/dual status  # 确认
+/dual on      # enable (off by default)
+/dual status  # verify
 ```
 
-> 扩展依赖 `@earendil-works/pi-coding-agent` / `@earendil-works/pi-ai` / `typebox`，这些在 Pi 运行时已内置（`npm:` 包已装在 Pi 的 node_modules），无需额外 npm install。
+> The extension depends on `@earendil-works/pi-coding-agent` / `@earendil-works/pi-ai` / `typebox`, which are already bundled with the Pi runtime (`npm:` packages are installed in Pi's node_modules). No extra `npm install` needed.
 
-### 依赖
+### Dependencies
 
-| 依赖 | 版本 | 用途 |
+| Dependency | Version | Purpose |
 |---|---|---|
-| Pi | 0.85.1 | 宿主；Controller/Judge 推理（`ctx.modelRegistry.complete`） |
-| Herdr | 0.9.0 | 可见 Pane 运行时（`pane split/rename/get`、`agent start/prompt/get/read`） |
-| pi-subagents | 0.67.0（已装，未编程调用） | 不重复实现；仅作为参考/可选 |
+| Pi | 0.85.1 | Host; Controller/Judge reasoning (`ctx.modelRegistry.complete`) |
+| Herdr | 0.9.0 | Visible pane runtime (`pane split/rename/get`, `agent start/prompt/get/read`) |
+| pi-subagents | 0.67.0 (installed, not called programmatically) | Not reimplemented; reference/optional only |
 
-> **职责边界**：Herdr 负责 terminal/pane runtime；pi-subagents 负责 Pi 子会话编排（本项目 Executor 直接跑在 Herdr 可见 pane 中，由 Herdr 官方 agent API 管理，故未调用 pi-subagents 编程 API）；**Dual-Gate 只负责 workflow / policy / convergence**。`executor/subagent-adapter` 保持薄：只把 `spawn / resume / status / cancel / result / pane reference` 映射到 Herdr CLI。
+> **Responsibility boundary**: Herdr owns the terminal/pane runtime; pi-subagents owns Pi sub-session orchestration (this project's Executor runs directly in a visible Herdr pane, managed by Herdr's official agent API, so pi-subagents' programming API is not called); **Dual-Gate only owns workflow / policy / convergence**. `executor/subagent-adapter` stays thin: it only maps `spawn / resume / status / cancel / result / pane reference` onto the Herdr CLI.
 
-## 模型（真实 ID 映射）
+## Models (real ID mapping)
 
-模型 ID **从当前 Pi registry 读取**，不硬编码。本机默认（已在安装时验证）：
+Model IDs are **read from the current Pi registry**, never hardcoded. Defaults on this machine (verified at install time):
 
-| 角色 | 默认 | 说明 |
+| Role | Default | Notes |
 |---|---|---|
-| Controller / Judge | `openai-codex/gpt-5.6-sol` | GPT-5.6 Sol，经 ChatGPT 订阅后端（`opencode/*` 无 auth，不可用） |
-| Controller thinking | `medium` | 模型支持映射到 medium |
-| Executor | `new-api/deepseek-v4-flash` | DeepSeek V4 Flash（本地网关，有 auth） |
+| Controller / Judge | `openai-codex/gpt-5.6-sol` | GPT-5.6 Sol, via ChatGPT subscription backend (`opencode/*` has no auth, unusable) |
+| Controller thinking | `medium` | model supports mapping to medium |
+| Executor | `new-api/deepseek-v4-flash` | DeepSeek V4 Flash (local gateway, has auth) |
 
-可随时切换：`/dual controller [id]`、`/dual executor [id]`、`/dual thinking [level]`。
+Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual thinking [level]`.
 
-## 命令
+## Commands
 
-| 命令 | 作用 |
+| Command | Effect |
 |---|---|
-| `/dual on` / `/dual off` | 开启/关闭。OFF 完全恢复普通 Pi |
-| `/dual status` | 状态：模型、Herdr、Task、State、Iteration、Spec 版本、Pane、Session 存活 |
-| `/dual models` | 查看当前模型配置 |
-| `/dual controller [id]` | 选择 Controller/Judge 模型（无参数弹 selector） |
-| `/dual executor [id]` | 选择 Executor 模型（无参数弹 selector） |
+| `/dual on` / `/dual off` | Enable/disable. OFF fully restores normal Pi |
+| `/dual status` | Status: models, Herdr, Task, State, Iteration, Spec version, Pane, Session alive |
+| `/dual models` | View current model config |
+| `/dual controller [id]` | Choose Controller/Judge model (no arg opens a selector) |
+| `/dual executor [id]` | Choose Executor model (no arg opens a selector) |
 | `/dual thinking [level]` | thinking: minimal/low/medium/high/xhigh/max |
-| `/dual cancel` | 取消当前任务：停止编排、保留 pane（重命名 `· CANCELLED`）、不删代码不 reset git |
-| `/dual bypass` | 下一条用户任务走普通 Pi，之后恢复 Dual-Gate |
-| `/dual cleanup` | 只关闭 Dual-Gate 创建的、已 DONE/CANCELLED/FAILED 的 pane（按 task ownership） |
+| `/dual cancel` | Cancel current task: stop orchestration, keep the pane (renamed `· CANCELLED`), don't delete code or reset git |
+| `/dual bypass` | Next user task goes through normal Pi, then Dual-Gate resumes |
+| `/dual cleanup` | Close only panes created by Dual-Gate that are DONE/CANCELLED/FAILED (by task ownership) |
 
-## 配置（`~/.pi/agent/dual-gate.json`）
+## Configuration (`~/.pi/agent/dual-gate.json`)
 
 ```json
 {
-  "enabled": false,   // 默认关闭；/dual on 后持久化为 true
+  "enabled": false,   // off by default; persisted to true after /dual on
   "controller": { "model": "openai-codex/gpt-5.6-sol", "thinking": "medium" },
   "executor": { "model": "new-api/deepseek-v4-flash" },
   "runtime": { "herdr": "required" },
@@ -122,16 +124,16 @@ cp -r extension ~/.pi/agent/extensions/dual-gate/
 }
 ```
 
-## Artifacts（每个任务）
+## Artifacts (per task)
 
 ```
 .pi/dual-gate/<task-id>/
 ├── task.md
-├── spec.yaml            # 最新 Expected Outcome
-├── spec-v1.yaml …       # 版本化 Expected
-├── spec-update.md       # SPEC UPDATE（增量同步给同一 session）
-├── spec-revisions.jsonl # 修订历史（为什么改）
-├── checkpoint.yaml      # L2 durable context（Executor Checkpoint）
+├── spec.yaml            # latest Expected Outcome
+├── spec-v1.yaml …       # versioned Expected
+├── spec-update.md       # SPEC UPDATE (incremental sync to the same session)
+├── spec-revisions.jsonl # revision history (why it changed)
+├── checkpoint.yaml      # L2 durable context (Executor Checkpoint)
 ├── checkpoint-itN.yaml
 ├── execution-report.yaml
 ├── execution-report-itN.yaml
@@ -141,56 +143,62 @@ cp -r extension ~/.pi/agent/extensions/dual-gate/
 ├── state.json / metadata.json
 ```
 
-不保存模型 private CoT；只保存 Expected / Actual / Delta / Gate / State。
+Model private CoT is never saved; only Expected / Actual / Delta / Gate / State.
 
-## 状态机
+## State Machine
 
 ```
 IDLE → PLANNING → SPAWNING_EXECUTOR → EXECUTING → GATING
-  ├─ GATING FAIL → FIXING_GATE → GATING（deterministic，不调 GPT）
+  ├─ GATING FAIL → FIXING_GATE → GATING (deterministic, no GPT)
   └─ GATING PASS → JUDGING
        ├─ converged → DONE
-       ├─ implementation_gap → FIXING_IMPLEMENTATION → (同 session) → GATING
-       ├─ spec_gap / mixed_gap → REVISING_SPEC → SPEC UPDATE → (同 session) → GATING
+       ├─ implementation_gap → FIXING_IMPLEMENTATION → (same session) → GATING
+       ├─ spec_gap / mixed_gap → REVISING_SPEC → SPEC UPDATE → (same session) → GATING
        └─ blocked → ESCALATED
-另：DIAGNOSING（迭代阈值 → Convergence Diagnosis）、WAITING_PERMISSION（高风险）、FAILED、CANCELLED
+Also: DIAGNOSING (iteration threshold → Convergence Diagnosis), WAITING_PERMISSION (high risk), FAILED, CANCELLED
 ```
 
-## 收敛与防循环
+## Convergence & Anti-loop
 
-- 每轮记录 `gap_count / previous_gap_count / same_gap_streak / progress`。
-- `gap_count` 下降 → improving；持平 → stalled；上升 → worsening。
-- 连续 2 轮相同 gap → `executor_stuck = true`，提示可 `/dual executor` 换更强模型（不迁就 Executor 改正确 Spec）。
-- 达到 `max_iterations`（默认 5）不机械失败：执行一次 **Convergence Diagnosis**（Astra），判断 continue / architecture / spec / executor / user。
+- Each round records `gap_count / previous_gap_count / same_gap_streak / progress`.
+- `gap_count` decreasing → improving; flat → stalled; increasing → worsening.
+- 2 consecutive identical gaps → `executor_stuck = true`, suggest `/dual executor` to switch to a stronger model (never bend the correct Spec to accommodate the Executor).
+- Reaching `max_iterations` (default 5) is not a mechanical failure: run a **Convergence Diagnosis** (Astra) to decide continue / architecture / spec / executor / user.
 
-## Session 异常恢复（L1/L2）
+## Session Crash Recovery (L1/L2)
 
-- **L1 Live Context**：DeepSeek session（pane 内 pi 进程）。
-- **L2 Durable Context**：Expected / Actual / Delta / Checkpoint / Diff / Gate。
-- 若 L1 丢失（pane 回收 / crash / restart），用 L2 在**新 pane**（标题 `· recovered`）恢复，提示 "Continue the existing task, do not restart from scratch"。
+- **L1 Live Context**: the DeepSeek session (the pi process inside the pane).
+- **L2 Durable Context**: Expected / Actual / Delta / Checkpoint / Diff / Gate.
+- If L1 is lost (pane reaped / crash / restart), recover with L2 in a **new pane** (titled `· recovered`), prompting "Continue the existing task, do not restart from scratch".
 
-## 已知环境事实（本机验证）
+## Known Environment Facts (verified on this machine)
 
-- `herdr pane split --cwd <git-repo>` 的 pane 会被回收（shell 检测失败），故 **split 始终用主 pane cwd**，Executor 通过 prompt 里的 REPOSITORY 路径自行 cd。
-- `agent prompt --wait` 对快速完成的回复会误报 `agent_prompt_stalled`——实际消息已处理；扩展用**轮询 `agent get` 到 idle/done**。
-- `pi -p`（print 模式）在异步 execFile 下可能 SIGTERM（需同步调用）；扩展内推理走 `modelRegistry.complete`（进程内），不受影响。
-- 主 pane cwd 的 split 稳定（连续 5/5 存活），git repo cwd 的 split 稳定回收（0/5 存活）。
+- `herdr pane split --cwd <git-repo>` panes get reaped (shell detection failure), so **split always uses the main pane cwd**; the Executor cd's itself via the REPOSITORY path in the prompt.
+- `agent prompt --wait` can falsely report `agent_prompt_stalled` for fast replies — the message is actually processed; the extension **polls `agent get` until idle/done** instead.
+- `pi -p` (print mode) can SIGTERM under async execFile (needs sync calls); in-extension reasoning goes through `modelRegistry.complete` (in-process), unaffected.
+- Splits on the main pane cwd are stable (5/5 survived); splits on a git repo cwd are reliably reaped (0/5 survived).
 
-## 测试
+## Tests
 
 ```bash
 cd /home/max/dual-gate
 node --experimental-strip-types tests/core.test.ts   # 45 passed
 ```
 
-覆盖：config 默认/规范化/非法值、task id/标题/agent 名、状态机转移、收敛跟踪、风险检测、YAML/Execution Report/Judge 解析（converged/implementation_gap/spec_gap/blocked）、contract/spec-revision/diagnosis 解析、prompt 构建（initial/delta-fix/judge）、artifact store、gate 发现（node/python/go/无命令）、gate 运行（pass/fail）。
+Covers: config defaults/normalization/invalid values, task id/title/agent name, state machine transitions, convergence tracking, risk detection, YAML/Execution Report/Judge parsing (converged/implementation_gap/spec_gap/blocked), contract/spec-revision/diagnosis parsing, prompt building (initial/delta-fix/judge), artifact store, gate discovery (node/python/go/no command), gate running (pass/fail).
 
-## 端到端验证记录（真实运行）
+## End-to-End Verification (real runs)
 
-已在 demo-repo（`/home/max/dual-gate/demo-repo`）真实跑通：
+Verified end-to-end against demo-repo (`/home/max/dual-gate/demo-repo`):
 
-1. `pane split --current --direction right --cwd /home/max --ratio 0.4 --no-focus` → `w2:p21`（可见 pane，与主 pane 同 tab）
+1. `pane split --current --direction right --cwd /home/max --ratio 0.4 --no-focus` → `w2:p21` (visible pane, same tab as main pane)
 2. `agent start ds-* --kind pi --pane w2:p21 -- --model new-api/deepseek-v4-flash --no-extensions` → `idle, interactive_ready`
-3. `agent prompt`（含 REPOSITORY + Expected Outcome）→ DeepSeek 在 pane 内真实执行：cd 到 repo、实现 `detectTabletMode`、发现 `node --test tests/` 目录参数问题并修复 package.json、`npm test` 1/1 pass
-4. 第二个 prompt（Delta：处理 undefined）→ **同一 session** 完成增量修复，最终 `return attached !== true`，测试通过
-5. `agent read` 全程可观察执行过程
+3. `agent prompt` (with REPOSITORY + Expected Outcome) → DeepSeek actually executes in the pane: cd to repo, implement `detectTabletMode`, discover the `node --test tests/` directory-arg problem and fix package.json, `npm test` 1/1 pass
+4. Second prompt (Delta: handle undefined) → **same session** completes the incremental fix, final `return attached !== true`, tests pass
+5. `agent read` observes the whole execution process
+
+---
+
+**License**: MIT
+
+**中文版** → [README.zh-CN.md](README.zh-CN.md)
