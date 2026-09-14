@@ -129,6 +129,18 @@ Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual product-m
 }
 ```
 
+## When to enable Dual-Gate
+
+Use this extension for **delivery work that needs an explicit acceptance contract and an auditable implementation loop**, not ordinary conversation or tiny, low-risk edits.
+
+| Need level | Entry point | Use it when |
+|---|---|---|
+| Conversation / exploration | Do not enable | You need an answer, research, brainstorming, or a decision—not repository changes with acceptance evidence. |
+| Bounded engineering task | `/dual on`, then send the task normally | One coherent change can be owned by one Executor session and verified by tests/Gate/Judge. Examples: a bug fix, a focused feature, a refactor, or a security-sensitive change. |
+| Project / product delivery | `/dual on`, then `/dual project <request>` | The request needs product planning, WBS/milestones, dependencies, staged acceptance, and progress feedback. This is the three-pane mode. |
+
+Do not use project mode for trivial edits, independent chores, or work that cannot justify milestone planning and an additional model session. Use ordinary task mode first when a project can be safely reduced to one acceptance contract.
+
 ## Project mode (three panes)
 
 `/dual project <request>` is explicit: ordinary prompts remain unchanged. Project mode creates a persistent visible **PM** Herdr pane before WBS generation, alongside the main Controller/Judge pane and the current milestone Executor pane. The PM is read-only (`read,grep,find,ls`; no shell or write tools) and produces its WBS only through durable project artifacts. Main Pi validates and presents that WBS for explicit user approval, then remains sole owner of milestone contracts, task planning/control, Gate, Judge, persistence, and cancellation.
