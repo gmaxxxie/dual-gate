@@ -22,6 +22,7 @@ import {
   STATE_TRANSITIONS,
   assertTransition,
   TaskManager,
+  sameJudgeGaps,
   trackConvergence,
   buildExecutorPrompt,
   buildJudgePrompt,
@@ -38,7 +39,7 @@ import {
   createArtifactStore,
   taskDirFor,
 } from "../extension/core.ts";
-import { discoverGateCommands, runGate, formatGateResult } from "../extension/gate.ts";
+import { discoverGateCommands, runGate, formatGateResult, skippedGateResult } from "../extension/gate.ts";
 
 let passed = 0;
 let failed = 0;
@@ -213,6 +214,15 @@ test("trackConvergence worsening", () => {
   tm.patch(t.taskId, { gapCount: 1 });
   const r = trackConvergence(t, 4, false);
   assert.equal(r.progress, "worsening");
+});
+
+test("distinct nonempty judge gaps reset convergence streak", () => {
+  assert.equal(sameJudgeGaps({ gaps: ["missing attach"] }, { gaps: ["missing detach"] }), false);
+  assert.equal(sameJudgeGaps({ gaps: ["Missing attach"] }, { gaps: ["missing attach"] }), true);
+  const tm = new TaskManager("/repo");
+  const t = tm.begin("x", { controller: { provider: "a", id: "b", name: "b" }, executor: { provider: "c", id: "d", name: "d" } });
+  tm.patch(t.taskId, { gapCount: 1, sameGapStreak: 1 });
+  assert.equal(trackConvergence(t, 1, false).sameGapStreak, 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -507,6 +517,13 @@ test("buildExecutorPrompt initial contains role + repo", () => {
   assert.ok(p.includes("Do not include your internal chain-of-thought"), "prompt must tell executor not to leak CoT");
 });
 
+test("buildExecutorPrompt honors explicit controller artifact directory", () => {
+  const contract = parseContractYaml("goal: g\ncontext: c\narchitecture:\n  relevant_components: []\nconstraints: []\nexpected_outcome:\n  - works\nacceptance_criteria:\n  - passes\nvalidation:\n  required: []\nrisk:\n  level: low\n  concerns: []", "req", 1);
+  const p = buildExecutorPrompt({ originalRequest: "req", contract, repoPath: "/worktree", mode: "initial", taskId: "t1", panelTitle: "DS · x", artifactDir: "/controller/.pi/dual-gate/t1" });
+  assert.ok(p.includes("/controller/.pi/dual-gate/t1/executor-report.yaml"));
+  assert.ok(!p.includes("/worktree/.pi/dual-gate/t1/executor-report.yaml"));
+});
+
 test("buildExecutorPrompt delta-fix has MUST PRESERVE + DELTA", () => {
   const contract = parseContractYaml(`goal: g\ncontext: c\narchitecture:\n  relevant_components:\n    - a.ts\nconstraints: []\nexpected_outcome:\n  - works\nacceptance_criteria:\n  - passes\nvalidation:\n  required: []\nrisk:\n  level: low\n  concerns: []`, "req", 2);
   const p = buildExecutorPrompt({
@@ -568,11 +585,22 @@ test("gate discovers go", () => {
   assert.ok(d.commands.some((c) => c.command.join(" ") === "go test ./..."));
 });
 
-test("gate no commands → skipped note", () => {
+test("gate no commands is an explicit successful skip", async () => {
   const dir = mkdtempSync(join(tmpdir(), "dg-gate-empty-"));
   const d = discoverGateCommands(dir);
   assert.equal(d.commands.length, 0);
-  assert.ok(d.notes.length >= 0);
+  assert.ok(d.notes.some((note) => note.includes("skipping gate")));
+  const result = await runGate(dir, d);
+  assert.equal(result.passed, true);
+  assert.equal(result.steps.length, 0);
+  assert.ok(formatGateResult(result).includes("no validation commands"));
+});
+
+test("configured gate skip is visible and successful", () => {
+  const result = skippedGateResult("disabled by configuration");
+  assert.equal(result.passed, true);
+  assert.equal(result.steps[0].skipped, true);
+  assert.ok(formatGateResult(result).includes("[SKIP]"));
 });
 
 test("gate runGate passes trivial true command", async () => {

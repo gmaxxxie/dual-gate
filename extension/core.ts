@@ -311,6 +311,14 @@ export class TaskManager {
  * Track the closed-loop progress between iterations. Returns whether to keep
  * going, escalate, or diagnose.
  */
+/** True only for two non-empty, semantically identical judge gap sets. */
+export function sameJudgeGaps(a: Pick<JudgeOutput, "gaps"> | null | undefined, b: Pick<JudgeOutput, "gaps"> | null | undefined): boolean {
+  if (!a || !b) return false;
+  const normalize = (gaps: string[]) => gaps.map((gap) => gap.toLowerCase().trim()).filter(Boolean).sort().join("|");
+  const left = normalize(a.gaps);
+  return left !== "" && left === normalize(b.gaps);
+}
+
 export function trackConvergence(task: TaskRecord, newGapCount: number, sameGap: boolean): {
   gapCount: number;
   previousGapCount: number;
@@ -342,6 +350,8 @@ export function buildExecutorPrompt(input: {
   delta?: Delta;
   taskId: string;
   panelTitle: string;
+  /** Controller-owned location, which may be outside an isolated worktree. */
+  artifactDir?: string;
 }): string {
   const c = input.contract;
   const criteriaLines = c.acceptance_criteria.map((x, i) => `  ${i + 1}. ${x}`).join("\n");
@@ -350,7 +360,11 @@ export function buildExecutorPrompt(input: {
   const archLines = c.architecture.relevant_components.map((x) => `  - ${x}`).join("\n");
   const riskLines = c.risk.concerns.map((x) => `  - ${x}`).join("\n");
   const validationLines = c.validation.required.map((x) => `  - ${x}`).join("\n");
-  const durableReportPath = join(input.repoPath, ".pi", "dual-gate", input.taskId, "executor-report.yaml");
+  // In isolated mode the controller's artifacts stay in the original checkout,
+  // so never infer this path from the executor's worktree.
+  const durableReportPath = input.artifactDir
+    ? join(input.artifactDir, "executor-report.yaml")
+    : join(input.repoPath, ".pi", "dual-gate", input.taskId, "executor-report.yaml");
 
   let body = "";
   if (input.mode === "initial") {
@@ -530,6 +544,9 @@ The previous executor failed to resolve these gaps over multiple iterations. App
 Fix the gaps, rerun validation, and produce an updated Execution Report (fenced YAML).`;
   }
 
+  if (input.mode !== "initial") {
+    body += `\n\nBefore sending the final report, also write the same YAML to:\n${durableReportPath}`;
+  }
   return body.trim();
 }
 

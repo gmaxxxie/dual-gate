@@ -46,7 +46,7 @@ Controller 规划
 - Stage 2：Repo Memory 共享知识积累
 - Stage 3：并行里程碑（worktree + 多 pane）
 
-**状态**：待实现（先做暂停/再分析/再分派功能）。
+**状态**：阶段性规划；暂停/再分析/同 pane 再分派已在当前实现中提供。
 
 ---
 
@@ -64,4 +64,4 @@ Controller 规划
 - 状态机新增 `PAUSED` 状态（从 EXECUTING/GATING/JUDGING/FIXING_* 可进入，可恢复回原状态）
 - 与现有 `/dual cancel`（终止任务）区分
 
-**状态**：待实现。
+**状态**：已实现基础暂停/恢复：轮询中的执行可在下一次轮询暂停，`/dual resume` 支持无参数恢复或带新需求恢复。跨 Pi 重启的任务恢复仍未实现。

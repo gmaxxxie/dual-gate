@@ -2,9 +2,10 @@
 // Uses the same code paths as the extension: core.ts parsing + gate.ts + herdr CLI.
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const REPO = '/home/max/dual-gate/demo-repo';
+const REPO = join(dirname(fileURLToPath(import.meta.url)), 'demo-repo');
 const CONTROLLER_MODEL = 'openai-codex/gpt-5.6-sol';
 const EXECUTOR_MODEL = 'new-api/deepseek-v4-flash';
 const THINKING = 'medium';
@@ -86,7 +87,11 @@ Implement the following (Controller contract):
 ${contractText}
 
 Rules: explore the repo yourself, implement, run "npm test", fix until green, and finish with a fenced YAML Execution Report (status/files_changed/tests/validation/acceptance_check). Do not commit.`;
-  await exec('herdr', ['agent', 'prompt', 'ds-demo1', taskText, '--timeout', '30000'], { timeoutMs: 45000 });
+  const dispatch = await exec('herdr', ['agent', 'prompt', 'ds-demo1', taskText, '--timeout', '30000'], { timeoutMs: 45000 });
+  if (dispatch.code !== 0) {
+    console.error('Executor prompt submission failed:', dispatch.stderr.slice(-500));
+    process.exit(1);
+  }
 
   // ---- 4. Wait for completion (poll idle) ----
   console.log('[4/6] Waiting for DeepSeek to finish...');
@@ -100,7 +105,10 @@ Rules: explore the repo yourself, implement, run "npm test", fix until green, an
       console.log('  agent state:', s);
     } catch { /* */ }
   }
-  if (!done) { console.error('timeout waiting for executor'); }
+  if (!done) {
+    console.error('Executor completion was not observed; refusing to invoke the gate or Judge.');
+    process.exit(1);
+  }
   const read = await exec('herdr', ['agent', 'read', 'ds-demo1', '--source', 'recent-unwrapped', '--lines', '200'], { timeoutMs: 15000 });
   const finalText = read.stdout;
   console.log('');
@@ -114,6 +122,10 @@ Rules: explore the repo yourself, implement, run "npm test", fix until green, an
   const gate = await exec('npm', ['test'], { cwd: REPO, timeoutMs: 120000 });
   console.log('  npm test exit:', gate.code);
   console.log('  ' + gate.stdout.split('\n').filter(l => l.includes('pass') || l.includes('fail')).slice(-3).join('\n  '));
+  if (gate.code !== 0) {
+    console.error('Gate failed; refusing to invoke the Judge.');
+    process.exit(1);
+  }
   console.log('');
 
   // ---- 6. Judge ----

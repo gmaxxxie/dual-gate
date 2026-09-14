@@ -169,7 +169,7 @@ Also: DIAGNOSING (iteration threshold → Convergence Diagnosis), WAITING_PERMIS
 
 - **L1 Live Context**: the DeepSeek session (the pi process inside the pane).
 - **L2 Durable Context**: Expected / Actual / Delta / Checkpoint / Diff / Gate.
-- If L1 is lost (pane reaped / crash / restart), recover with L2 in a **new pane** (titled `· recovered`), prompting "Continue the existing task, do not restart from scratch".
+- If L1 is lost (pane reaped / crash) while the extension session remains active, recover with L2 in a **new pane** (titled `· recovered`), prompting "Continue the existing task, do not restart from scratch". A Pi restart preserves artifacts for inspection but does not yet resume an in-flight loop automatically.
 
 ## Known Environment Facts (verified on this machine)
 
@@ -181,15 +181,15 @@ Also: DIAGNOSING (iteration threshold → Convergence Diagnosis), WAITING_PERMIS
 ## Tests
 
 ```bash
-cd /home/max/dual-gate
-node --experimental-strip-types tests/core.test.ts   # 45 passed
+cd /path/to/dual-gate
+node --experimental-strip-types tests/core.test.ts   # core assertions
 ```
 
 Covers: config defaults/normalization/invalid values, task id/title/agent name, state machine transitions, convergence tracking, risk detection, YAML/Execution Report/Judge parsing (converged/implementation_gap/spec_gap/blocked), contract/spec-revision/diagnosis parsing, prompt building (initial/delta-fix/judge), artifact store, gate discovery (node/python/go/no command), gate running (pass/fail).
 
 ## End-to-End Verification (real runs)
 
-Verified end-to-end against demo-repo (`/home/max/dual-gate/demo-repo`):
+The authenticated, mutating end-to-end demo targets this checkout's `demo-repo/` (the scripts derive the path from their own location):
 
 1. `pane split --current --direction right --cwd /home/max --ratio 0.4 --no-focus` → `w2:p21` (visible pane, same tab as main pane)
 2. `agent start ds-* --kind pi --pane w2:p21 -- --model new-api/deepseek-v4-flash --no-extensions` → `idle, interactive_ready`

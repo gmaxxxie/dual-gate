@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Dual-Gate E2E: Controller (GPT-5.6 Sol) → visible Herdr pane → DeepSeek → Gate → Judge → Delta → converge.
 # Uses real CLI verified on this machine.
-set -uo pipefail
+set -euo pipefail
 
-REPO="/home/max/dual-gate/demo-repo"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REPO="$SCRIPT_DIR/demo-repo"
 CONTROLLER="openai-codex/gpt-5.6-sol"
 EXECUTOR="new-api/deepseek-v4-flash"
 WORKDIR="$HOME"   # split cwd = main pane cwd (git-repo cwd panes get recycled)
@@ -71,18 +72,26 @@ $CONTRACT
 
 Rules: explore the repo yourself, implement, run npm test, fix until green, do not commit.
 Finish with a fenced YAML Execution Report: status/summary/files_changed/tests/validation/acceptance_check, then a final line containing exactly: EXEC-REPORT-END"
-timeout 60 herdr agent prompt "$AGENT" "$TASK" --wait --timeout 40000 >/dev/null 2>&1 || true
+if ! timeout 60 herdr agent prompt "$AGENT" "$TASK" --timeout 40000 >/dev/null; then
+  echo "  [ERR] executor prompt submission failed"
+  exit 1
+fi
 # Wait for the completion marker in pane content (state polling is unreliable).
 if wait_for_marker "$AGENT" "EXEC-REPORT-END" 30; then
   echo "  [OK] executor finished (content marker found)"
 else
-  echo "  [WARN] marker not found (exit=$?) - dumping last pane content"
+  echo "  [ERR] executor completion marker not found - dumping last pane content"
+  exit 1
 fi
 cp /tmp/dg-agent-read.txt /tmp/dg-report1.txt 2>/dev/null || true
 tail -6 /tmp/dg-report1.txt
 
 step "5/7 deterministic gate"
-GATE=$(cd "$REPO" && timeout 120 npm test 2>&1)
+if ! GATE=$(cd "$REPO" && timeout 120 npm test 2>&1); then
+  echo "$GATE"
+  echo "  [ERR] deterministic gate failed; refusing to invoke the Judge"
+  exit 1
+fi
 echo "$GATE" | grep -E "pass|fail" | head -4
 
 step "6/7 Judge compare Expected ↔ Actual (GPT-5.6 Sol)"
@@ -102,8 +111,14 @@ DELTA_MSG="The previous implementation is partially correct. Delta:
 - required: treat undefined as detached (return true), preserve true/false behavior
 - must_preserve: existing tests pass
 Fix only the gaps, rerun npm test, reply DELTA-DONE when green."
-timeout 60 herdr agent prompt "$AGENT" "$DELTA_MSG" --wait --timeout 40000 >/dev/null 2>&1 || true
-wait_for_marker "$AGENT" "DELTA-DONE" 30
+if ! timeout 60 herdr agent prompt "$AGENT" "$DELTA_MSG" --timeout 40000 >/dev/null; then
+  echo "  [ERR] delta prompt submission failed"
+  exit 1
+fi
+if ! wait_for_marker "$AGENT" "DELTA-DONE" 30; then
+  echo "  [ERR] delta completion marker not found"
+  exit 1
+fi
 cp /tmp/dg-agent-read.txt /tmp/dg-report2.txt 2>/dev/null || true
 tail -5 /tmp/dg-report2.txt
 echo ""

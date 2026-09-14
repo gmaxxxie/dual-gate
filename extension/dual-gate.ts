@@ -50,6 +50,7 @@ import {
   parseSpecRevision,
   parseConvergenceDiagnosis,
   trackConvergence,
+  sameJudgeGaps,
   TaskManager,
   type ModelRegistryAdapter,
   type ArtifactStore,
@@ -61,7 +62,7 @@ import {
   type SpecRevision,
   type ConvergenceDiagnosis,
 } from "./core.ts";
-import { discoverGateCommands, runGate, formatGateResult, type GateResult } from "./gate.ts";
+import { discoverGateCommands, runGate, formatGateResult, skippedGateResult, type GateResult } from "./gate.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -83,6 +84,8 @@ interface DgRuntime {
   running: boolean;
   stopRequested: boolean;
   pauseRequested: boolean;
+  /** A separate flag keeps an argument-less resume distinct from no resume. */
+  resumeRequested: boolean;
   pendingResumeRequirement: string | undefined;
 }
 
@@ -101,6 +104,27 @@ function showText(text: string): void {
 function getRuntime(): DgRuntime {
   if (!runtime) throw new Error("dual-gate runtime not initialized");
   return runtime;
+}
+
+function taskStopped(task: TaskRecord): boolean {
+  const rt = getRuntime();
+  const current = rt.manager.get(task.taskId);
+  return rt.stopRequested || !current || ["CANCELLED", "FAILED", "ESCALATED", "DONE"].includes(current.state);
+}
+
+function higherRisk(
+  contract: AcceptanceContract,
+  deterministic: ReturnType<typeof detectRisk>,
+): AcceptanceContract {
+  const rank = { low: 0, medium: 1, high: 2 } as const;
+  if (rank[deterministic.level] <= rank[contract.risk.level]) return contract;
+  return {
+    ...contract,
+    risk: {
+      level: deterministic.level,
+      concerns: [...new Set([...contract.risk.concerns, ...deterministic.concerns])],
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -803,6 +827,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
   const config = rt.config;
   const store = makeStore(task);
   rt.running = true;
+  rt.stopRequested = false;
 
   try {
     // ---- Phase 0: Plan (Expected V1) ----
@@ -810,6 +835,11 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
     writeMetadata(task, store);
     writeState(task, store);
     let contract = await plan(ctx, task, config, store);
+    if (taskStopped(task)) return;
+    // Model-produced risk can add detail, but cannot downgrade deterministic
+    // risk derived from the user's original request.
+    contract = higherRisk(contract, detectRisk(task.originalRequest));
+    writeSpecVersioned(store, contract.version, contract);
     rt.manager.patch(task.taskId, { risk: contract.risk.level });
     writeState(task, store);
 
@@ -822,6 +852,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
         "High-risk task",
         `This task touches: ${contract.risk.concerns.join(", ") || "sensitive areas"}.\nContinue in a new DeepSeek pane?`,
       );
+      if (taskStopped(task)) return;
       if (!ok) {
         rt.manager.patch(task.taskId, { state: "CANCELLED", currentStage: "cancelled", error: "High-risk task declined by user" });
         writeState(task, store);
@@ -839,6 +870,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
     const concurrentWriters = rt.manager.all().filter((t) => t.taskId !== task.taskId && ["EXECUTING", "GATING", "JUDGING", "FIXING_IMPLEMENTATION", "REVISING_SPEC"].includes(t.state)).length;
     if (mode === "isolated" || (mode === "auto" && concurrentWriters > 0)) {
       worktreePath = await createWorktree(repoPath, task.taskId);
+      if (taskStopped(task)) return;
       rt.manager.patch(task.taskId, { worktreePath });
     }
     writeState(task, store);
@@ -853,6 +885,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
     let executorActive = false;
 
     while (iteration < maxIterations) {
+      if (taskStopped(task)) return;
       iteration += 1;
       rt.manager.patch(task.taskId, { iteration, currentStage: `iteration-${iteration}` });
       writeState(task, store);
@@ -885,7 +918,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
       // ---- Spawn executor (only on first iteration or spec revision) ----
       if (!executorActive) {
         await spawnExecutor(ctx, task, config);
-        if (task.state !== "EXECUTING") return; // spawn failed
+        if (taskStopped(task) || task.state !== "EXECUTING") return; // stopped or spawn failed
         executorActive = true;
       }
 
@@ -893,11 +926,41 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
       const cwd = worktreePath ?? repoPath;
       const waitResult = await waitForExecutorCompletion(task, config, {
         onTick: (state) => setStatus(ctx, `dual-gate: executing (${state})`),
+        shouldStop: () => taskStopped(task),
+        shouldPause: () => rt.pauseRequested,
       });
+      if (taskStopped(task)) return;
+      if (waitResult.paused) {
+        const pause = await pauseCheckpoint(ctx, task, config, store);
+        if (!pause.resumed) return;
+        if (pause.newRequirement) {
+          const revised = await reviseSpec(ctx, task, config, contract, {
+            verdict: "spec_gap", confidence: "medium", expected: contract.expected_outcome, actual: [], matched: [],
+            gaps: ["New requirement from user: " + pause.newRequirement], implementation_changes: [], spec_changes: ["Merge new requirement"],
+            delta: { matched: [], missing: [], incorrect: [], unexpected: [], required_changes: [], must_preserve: [] },
+            reason: "User requested a change during execution.",
+          }, report, store);
+          if (revised) {
+            contract = revised.contract;
+            rt.manager.patch(task.taskId, { expectedVersion: contract.version, specRevisions: (task.specRevisions ?? 0) + 1 });
+            writeState(task, store);
+            const update = buildExecutorPrompt({
+              originalRequest: task.originalRequest, contract, repoPath: cwd, mode: "delta-fix",
+              delta: { matched: [], missing: [], incorrect: [], unexpected: [], required_changes: revised.implementation_changes, must_preserve: [] },
+              taskId: task.taskId, panelTitle: derivePanelTitle(task.taskId, basename(task.repoPath), task.originalRequest), artifactDir: store.dir(),
+            });
+            const send = await herdrAgentPrompt({ target: task.herdrAgentName!, text: update, wait: false, timeoutMs: 120_000 });
+            if (taskStopped(task)) return;
+            if (!send.ok) throw new Error(`requirement update prompt failed: ${send.error}`);
+          }
+        }
+        continue;
+      }
       if (waitResult.lost) {
         // L1 (live session) lost — recover from L2 durable context in a new pane.
         ctx.ui.notify("Dual-Gate: executor session lost — recovering from checkpoint…", "warning");
         const recovered = await recoverExecutor(ctx, task, config, contract, store, iteration);
+        if (taskStopped(task)) return;
         if (!recovered) {
           rt.manager.patch(task.taskId, { state: "FAILED", currentStage: "failed", error: "Executor session lost and recovery failed" });
           writeState(task, store);
@@ -913,6 +976,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
       }
 
       // ---- Pause checkpoint after execution (user may inspect / re-analyze) ----
+      let requirementRevised = false;
       {
         const pause = await pauseCheckpoint(ctx, task, config, store);
         if (!pause.resumed) return;
@@ -930,29 +994,46 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
             delta: { matched: [], missing: [], incorrect: [], unexpected: [], required_changes: [], must_preserve: [] },
             reason: "User requested a change during execution.",
           }, report, store);
+          if (taskStopped(task)) return;
           if (revised) {
             contract = revised.contract;
             rt.manager.patch(task.taskId, { expectedVersion: contract.version, specRevisions: (task.specRevisions ?? 0) + 1 });
             writeState(task, store);
+            const update = buildExecutorPrompt({
+              originalRequest: task.originalRequest, contract, repoPath: cwd, mode: "delta-fix",
+              delta: { matched: [], missing: [], incorrect: [], unexpected: [], required_changes: revised.implementation_changes, must_preserve: [] },
+              taskId: task.taskId, panelTitle: derivePanelTitle(task.taskId, basename(task.repoPath), task.originalRequest), artifactDir: store.dir(),
+            });
+            const send = await herdrAgentPrompt({ target: task.herdrAgentName!, text: update, wait: false, timeoutMs: 120_000 });
+            if (taskStopped(task)) return;
+            if (!send.ok) throw new Error(`requirement update prompt failed: ${send.error}`);
+            requirementRevised = true;
           }
         }
       }
+      if (requirementRevised) continue;
 
       // ---- Read the execution report ----
       const finalText = await herdrAgentRead({ target: task.herdrAgentName!, lines: 400 });
+      if (taskStopped(task)) return;
       // Pi's alternate-screen scrollback may retain only the tail of a report.
       // Prefer the executor's durable report when it was written, then fall
       // back to the terminal transcript for older workers.
       const durableReport = store.read("executor-report.yaml");
       report = extractReportFromAgentMessage(durableReport || finalText);
+      if (config.context.send_full_executor_history_to_judge) {
+        report = { ...report, executor_history: finalText };
+      }
       store.write("execution-report.yaml", JSON.stringify(report, null, 2));
       store.write(`execution-report-it${iteration}.yaml`, JSON.stringify(report, null, 2));
       store.write(`execution-report-raw-it${iteration}.md`, finalText);
 
       // ---- Deterministic gate ----
+      if (taskStopped(task)) return;
       rt.manager.patch(task.taskId, { state: "GATING", currentStage: "gating" });
       writeState(task, store);
       gateResult = await runDeterministicGate(ctx, task, config);
+      if (taskStopped(task)) return;
 
       // ---- Gate fix loop (deterministic; no GPT) ----
       let gateLoop = 0;
@@ -976,16 +1057,21 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
           gateErrors,
           taskId: task.taskId,
           panelTitle: derivePanelTitle(task.taskId, basename(task.repoPath), task.originalRequest),
+          artifactDir: store.dir(),
         });
         const send = await herdrAgentPrompt({ target: task.herdrAgentName!, text: fixPrompt, wait: false, timeoutMs: 120_000 });
+        if (taskStopped(task)) return;
         if (!send.ok) {
           throw new Error(`fix prompt failed: ${send.error}`);
         }
-        await waitForExecutorCompletion(task, config);
+        await waitForExecutorCompletion(task, config, { shouldStop: () => taskStopped(task) });
+        if (taskStopped(task)) return;
         const fixText = await herdrAgentRead({ target: task.herdrAgentName!, lines: 400 });
+        if (taskStopped(task)) return;
         report = extractReportFromAgentMessage(fixText);
         store.write("execution-report.yaml", JSON.stringify(report, null, 2));
         gateResult = await runDeterministicGate(ctx, task, config);
+        if (taskStopped(task)) return;
         gateLoop++;
       }
 
@@ -1002,20 +1088,29 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
       ctx.ui.notify("Dual-Gate: Gate PASS — comparing Expected ↔ Actual…", "info");
 
       diff = await getDiff(cwd);
+      if (taskStopped(task)) return;
       const gateSummary = formatGateResult(gateResult);
-      let judgeOutput: JudgeOutput;
-      try {
-        judgeOutput = await judge(ctx, task, config, contract, report, diff, gateSummary, lastJudge);
-      } catch (e) {
-        rt.manager.patch(task.taskId, { state: "FAILED", currentStage: "failed", error: `Judge failed: ${errMsg(e)}` });
+      let judgeOutput: JudgeOutput | null = null;
+      let judgeError: unknown;
+      for (let attempt = 0; attempt <= config.judge.max_retries; attempt++) {
+        try {
+          judgeOutput = await judge(ctx, task, config, contract, report, diff, gateSummary, lastJudge);
+          break;
+        } catch (e) {
+          judgeError = e;
+          rt.manager.patch(task.taskId, { judgeFailures: (task.judgeFailures ?? 0) + 1 });
+          store.write(`judge-error-it${iteration}-${attempt + 1}.txt`, errMsg(e));
+          if (taskStopped(task)) return;
+        }
+      }
+      if (!judgeOutput) {
+        rt.manager.patch(task.taskId, { state: "FAILED", currentStage: "failed", error: `Judge failed after ${config.judge.max_retries + 1} attempts: ${errMsg(judgeError)}` });
         writeState(task, store);
-        ctx.ui.notify(`Dual-Gate: Judge error — ${errMsg(e)}`, "error");
+        ctx.ui.notify(`Dual-Gate: Judge error — ${errMsg(judgeError)}`, "error");
         return;
       }
       store.write(`judge-it${iteration}.yaml`, JSON.stringify(judgeOutput, null, 2));
       store.write("judge.yaml", JSON.stringify(judgeOutput, null, 2));
-      lastJudge = judgeOutput;
-
       // ---- L2 durable context: Executor Checkpoint (compress context, do not lose state) ----
       const checkpoint = buildExecutorCheckpoint({
         taskId: task.taskId,
@@ -1033,7 +1128,8 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
 
       // ---- Convergence tracking ----
       const gapCount = judgeOutput.gaps.length;
-      const sameGap = lastJudge ? sameGaps(lastJudge, judgeOutput) : false;
+      const sameGap = sameJudgeGaps(lastJudge, judgeOutput);
+      lastJudge = judgeOutput;
       const conv = trackConvergence(task, gapCount, sameGap);
       rt.manager.patch(task.taskId, {
         gapCount: conv.gapCount,
@@ -1092,8 +1188,10 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
           delta,
           taskId: task.taskId,
           panelTitle: derivePanelTitle(task.taskId, basename(task.repoPath), task.originalRequest),
+          artifactDir: store.dir(),
         });
         const send = await herdrAgentPrompt({ target: task.herdrAgentName!, text: fixPrompt, wait: false, timeoutMs: 120_000 });
+        if (taskStopped(task)) return;
         if (!send.ok) {
           throw new Error(`delta fix prompt failed: ${send.error}`);
         }
@@ -1185,6 +1283,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
           delta,
           taskId: task.taskId,
           panelTitle: derivePanelTitle(task.taskId, basename(task.repoPath), task.originalRequest),
+          artifactDir: store.dir(),
         });
         const send = await herdrAgentPrompt({ target: task.herdrAgentName!, text: fixPrompt, wait: false, timeoutMs: 120_000 });
         if (!send.ok) {
@@ -1237,22 +1336,18 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
       }
     }
   } catch (e) {
-    rt.manager.patch(task.taskId, { state: "FAILED", currentStage: "failed", error: errMsg(e) });
-    writeState(task, store);
-    ctx.ui.notify(`Dual-Gate: error — ${errMsg(e)}`, "error");
+    // A cancellation can race any awaited transport call; never overwrite its
+    // terminal state with FAILED.
+    if (!taskStopped(task)) {
+      rt.manager.patch(task.taskId, { state: "FAILED", currentStage: "failed", error: errMsg(e) });
+      writeState(task, store);
+      ctx.ui.notify(`Dual-Gate: error — ${errMsg(e)}`, "error");
+    }
   } finally {
     rt.running = false;
     updateWidget(ctx);
     setStatus(ctx, undefined);
   }
-}
-
-function sameGaps(a: JudgeOutput, b: JudgeOutput): boolean {
-  if (!a || !b) return false;
-  const norm = (xs: string[]) => xs.map((x) => x.toLowerCase().trim()).filter(Boolean).sort();
-  const ga = norm(a.gaps).join("|");
-  const gb = norm(b.gaps).join("|");
-  return ga !== "" && ga === gb;
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,8 +1436,11 @@ async function spawnExecutor(ctx: ExtensionCommandContext, task: TaskRecord, con
       mode: "initial",
       taskId: task.taskId,
       panelTitle,
+      artifactDir: makeStore(task).dir(),
     });
-    const send = await herdrAgentPrompt({ target: agentName, text: prompt, wait: true, timeoutMs: 300_000 });
+    // Dispatch is deliberately non-blocking: Herdr's --wait can report a
+    // false stall after successfully delivering a prompt. Completion is polled.
+    const send = await herdrAgentPrompt({ target: agentName, text: prompt, wait: false, timeoutMs: 120_000 });
     if (!send.ok) {
       throw new Error(`agent prompt failed: ${send.error}`);
     }
@@ -1351,9 +1449,11 @@ async function spawnExecutor(ctx: ExtensionCommandContext, task: TaskRecord, con
     writeState(task, makeStore(task));
     ctx.ui.notify(`Dual-Gate: Executor running in ${panelTitle}`, "info");
   } catch (e) {
-    rt.manager.patch(task.taskId, { state: "FAILED", currentStage: "failed", error: errMsg(e) });
-    writeState(task, makeStore(task));
-    ctx.ui.notify(`Dual-Gate: executor spawn failed — ${errMsg(e)}`, "error");
+    if (!taskStopped(task)) {
+      rt.manager.patch(task.taskId, { state: "FAILED", currentStage: "failed", error: errMsg(e) });
+      writeState(task, makeStore(task));
+      ctx.ui.notify(`Dual-Gate: executor spawn failed — ${errMsg(e)}`, "error");
+    }
   }
 }
 
@@ -1450,8 +1550,8 @@ async function recoverExecutor(
 async function waitForExecutorCompletion(
   task: TaskRecord,
   config: ReturnType<typeof normalizeConfig>,
-  opts: { pollMs?: number; timeoutMs?: number; onTick?: (state: string) => void } = {},
-): Promise<{ completed: boolean; state?: string; lost?: boolean }> {
+  opts: { pollMs?: number; timeoutMs?: number; onTick?: (state: string) => void; shouldStop?: () => boolean; shouldPause?: () => boolean } = {},
+): Promise<{ completed: boolean; state?: string; lost?: boolean; paused?: boolean }> {
   const agent = task.herdrAgentName;
   if (!agent) return { completed: false, lost: true };
   const pollMs = opts.pollMs ?? 10_000;
@@ -1460,6 +1560,8 @@ async function waitForExecutorCompletion(
   let lastState = "unknown";
   let lostStreak = 0;
   while (Date.now() - started < timeoutMs) {
+    if (opts.shouldStop?.()) return { completed: false, state: lastState };
+    if (opts.shouldPause?.()) return { completed: false, state: lastState, paused: true };
     const st = await herdrAgentGet({ target: agent });
     if (!st.state && st.idle === undefined) {
       lostStreak++;
@@ -1519,7 +1621,8 @@ async function pauseCheckpoint(
     if (t.state === "PAUSED") {
       // still paused: check for a queued resume requirement
       const pending = rt.pendingResumeRequirement;
-      if (pending !== undefined) {
+      if (rt.resumeRequested) {
+        rt.resumeRequested = false;
         rt.pendingResumeRequirement = undefined;
         // restore to the state we were in before pausing (or EXECUTING default)
         const backTo = pausedState && pausedState !== "PAUSED" ? pausedState : "EXECUTING";
@@ -1546,6 +1649,12 @@ async function runDeterministicGate(
 ): Promise<GateResult> {
   const store = makeStore(task);
   const cwd = task.worktreePath ?? task.repoPath;
+  if (!config.gate.enabled) {
+    const result = skippedGateResult("Deterministic gate disabled by configuration.");
+    store.write("gate-discovery.json", { commands: [], notes: ["Deterministic gate disabled by configuration."] });
+    store.write("gate.log", formatGateResult(result));
+    return result;
+  }
   const discovery = discoverGateCommands(cwd);
   store.write("gate-discovery.json", { commands: discovery.commands, notes: discovery.notes });
   const result = await runGate(cwd, discovery, { timeoutMs: config.gate.timeoutMs });
@@ -1800,6 +1909,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     running: false,
     stopRequested: false,
     pauseRequested: false,
+    resumeRequested: false,
     pendingResumeRequirement: undefined,
   };
 
@@ -1827,6 +1937,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     // queue it and resume automatically (no /dual resume needed).
     const active = rt.manager.active();
     if (active && active.state === "PAUSED") {
+      rt.resumeRequested = true;
       rt.pendingResumeRequirement = text;
       ctx.ui.notify("Dual-Gate: new requirement received — resuming for re-analysis", "info");
       updateWidget(ctx);
@@ -1917,6 +2028,13 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
           break;
         }
         case "off": {
+          // OFF stops an in-flight loop as well as future input interception.
+          rt.stopRequested = true;
+          const active = rt.manager.active();
+          if (active) {
+            rt.manager.cancelActive("Dual-Gate disabled by user");
+            writeState(active, makeStore(active));
+          }
           rt.config.enabled = false;
           saveConfig({ enabled: false });
           ctx.ui.notify("Dual-Gate disabled — normal Pi", "info");
@@ -1984,6 +2102,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
           }
           // Optional: remainder of args becomes the new requirement text.
           const newReq = rest.length ? rest.join(" ") : undefined;
+          rt.resumeRequested = true;
           rt.pendingResumeRequirement = newReq;
           ctx.ui.notify(newReq ? "Dual-Gate: resume with new requirement — re-analyzing…" : "Dual-Gate: resume", "info");
           updateWidget(ctx);

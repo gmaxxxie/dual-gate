@@ -22,6 +22,14 @@ export interface GateResult {
   error?: string;
 }
 
+/** An explicit successful skip, used when configuration disables the gate. */
+export function skippedGateResult(reason: string): GateResult {
+  return {
+    passed: true,
+    steps: [{ name: "gate:skipped", command: "(not run)", passed: true, skipped: true, exitCode: null, outputTail: reason, durationMs: 0 }],
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
@@ -283,7 +291,9 @@ export async function runGate(
       return { passed: false, steps };
     }
   }
-  const passed = steps.length > 0 && steps.every((s) => s.passed);
+  // An empty discovery is explicitly a skipped, successful gate: there is no
+  // project-authoritative command to run, so retrying cannot make progress.
+  const passed = steps.every((s) => s.passed);
   return { passed, steps };
 }
 
