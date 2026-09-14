@@ -314,6 +314,18 @@ function herdrAvailable(): boolean {
   return env === "1" || env === "true";
 }
 
+/**
+ * Check whether the current Pi process can actually drive Herdr panes:
+ * it must run INSIDE a Herdr pane (HERDR_PANE_ID + HERDR_ENV set).
+ * Without these, `herdr pane split --current` fails with
+ * "--current requires HERDR_PANE_ID" and every executor spawn errors out.
+ */
+function herdrEnvironmentProblem(): string | null {
+  if (!process.env.HERDR_PANE_ID) return "Pi 不在 Herdr pane 中运行：缺少 HERDR_PANE_ID";
+  if (!herdrAvailable()) return "Pi 不在 Herdr 环境中运行：缺少 HERDR_ENV";
+  return null;
+}
+
 function parseHerdrJson<T>(raw: string): { ok: boolean; result?: T; error?: string } {
   try {
     const parsed = JSON.parse(raw);
@@ -671,6 +683,13 @@ async function plan(ctx: ExtensionCommandContext, task: TaskRecord, config: Retu
 
   ctx.ui.notify("Dual-Gate: Controller planning…", "info");
   setStatus(ctx, "dual-gate: planning");
+  // Show a working message so the user knows it's thinking (not frozen),
+  // and reflect the actual controller model + thinking level.
+  try {
+    const ctlLabel = controllerRef.id || config.controller.model;
+    ctx.ui.setWorkingMessage(`Dual-Gate · ${ctlLabel} (${config.controller.thinking}) 正在规划…`);
+  } catch { /* ignore */ }
+  const t0 = Date.now();
 
   const system = `You are the Controller/Architect of a Dual-Gate workflow. You do NOT write code or modify the repository.
 Produce a precise Acceptance Contract (Expected Outcome) that specifies WHAT to achieve and WHY, without implementing it.
@@ -701,6 +720,13 @@ risk:
   const user = `REPOSITORY: ${task.repoPath}\n\nTASK ID: ${task.taskId}\n\nORIGINAL USER REQUEST:\n${task.originalRequest}\n\nProduce the Acceptance Contract (fenced YAML).`;
 
   const text = await completeText(ctx, controllerRef, system, user, { thinking });
+
+  try {
+    ctx.ui.setWorkingMessage();
+  } catch { /* ignore */ }
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  ctx.ui.notify(`Dual-Gate: 规划完成（${elapsed}s）`, "info");
+  setStatus(ctx, `dual-gate: planned (${elapsed}s)`);
 
   store.write("task.md", `# Task ${task.taskId}\n\n## Original Request\n${task.originalRequest}\n`);
   const contract = parseContractYaml(text, task.originalRequest, 1);
@@ -1123,6 +1149,20 @@ async function spawnExecutor(ctx: ExtensionCommandContext, task: TaskRecord, con
   const rt = getRuntime();
   const registry = makeRegistry(ctx);
   const executorRef = registry.find(config.executor.model) ?? { provider: "", id: config.executor.model, name: config.executor.model };
+
+  // Preflight: dual-gate needs to run INSIDE a Herdr pane to split a new
+  // executor pane. Outside Herdr this fails with a bare CLI error; give the
+  // user a clear message instead.
+  const envProblem = herdrEnvironmentProblem();
+  if (envProblem) {
+    rt.manager.patch(task.taskId, { state: "FAILED", currentStage: "failed", error: envProblem });
+    writeState(task, makeStore(task));
+    ctx.ui.notify(
+      `Dual-Gate: ${envProblem} — 请在 Herdr pane 中启动 Pi（或执行 /dual status 查看）`,
+      "error",
+    );
+    return;
+  }
 
   ctx.ui.notify(`Dual-Gate: spawning Executor (${executorRef.id})…`, "info");
   setStatus(ctx, "dual-gate: spawning executor");
