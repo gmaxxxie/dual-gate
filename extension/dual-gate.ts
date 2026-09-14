@@ -69,6 +69,7 @@ import { discoverGateCommands, runGate, formatGateResult, type GateResult } from
 
 const EXT_VERSION = "1.0.0";
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "dual-gate.json");
+const HERDR_PI_STATE_EXTENSION_PATH = join(homedir(), ".pi", "agent", "extensions", "herdr-agent-state.ts");
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -328,9 +329,12 @@ function herdrEnvironmentProblem(): string | null {
 
 function parseHerdrJson<T>(raw: string): { ok: boolean; result?: T; error?: string } {
   try {
-    const parsed = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(raw);
+    // Herdr CLI responses are envelopes: { id, result: { ... }, type }.
+    // Return the payload, not the envelope itself, so callers can read fields
+    // such as result.pane.pane_id consistently.
     if (parsed && typeof parsed === "object" && "result" in parsed) {
-      return { ok: true, result: parsed as T };
+      return { ok: true, result: (parsed as { result: T }).result };
     }
     return { ok: true, result: parsed as T };
   } catch {
@@ -360,6 +364,17 @@ async function herdrPaneExists(paneId: string): Promise<boolean> {
   return code === 0;
 }
 
+function executorPiArgs(model: string): string[] {
+  // Keep all user extensions disabled to prevent recursive Dual-Gate tasks,
+  // but explicitly retain Herdr's Pi state reporter so worker lifecycle can
+  // be observed reliably.
+  const args = ["--model", model, "--no-extensions"];
+  if (existsSync(HERDR_PI_STATE_EXTENSION_PATH)) {
+    args.push("--extension", HERDR_PI_STATE_EXTENSION_PATH);
+  }
+  return args;
+}
+
 async function herdrAgentStart(opts: { name: string; kind: string; pane: string; timeoutMs?: number; args?: string[] }): Promise<void> {
   const args = ["agent", "start", opts.name, "--kind", opts.kind, "--pane", opts.pane];
   if (opts.timeoutMs) args.push("--timeout", String(opts.timeoutMs));
@@ -372,8 +387,10 @@ async function herdrAgentStart(opts: { name: string; kind: string; pane: string;
 
 async function herdrAgentPrompt(opts: { target: string; text: string; wait?: boolean; timeoutMs?: number }): Promise<{ ok: boolean; error?: string }> {
   const args = ["agent", "prompt", opts.target, opts.text];
-  if (opts.wait) args.push("--wait");
-  if (opts.timeoutMs) args.push("--timeout", String(opts.timeoutMs));
+  if (opts.wait) {
+    args.push("--wait");
+    if (opts.timeoutMs) args.push("--timeout", String(opts.timeoutMs));
+  }
   const { code, stdout, stderr } = await exec("herdr", args, { timeoutMs: (opts.timeoutMs ?? 120_000) + 15_000 });
   if (code !== 0) {
     return { ok: false, error: (stderr || stdout || `exit ${code}`).slice(0, 1000) };
@@ -387,7 +404,9 @@ async function herdrAgentGet(opts: { target: string }): Promise<{ state?: string
   try {
     const parsed = JSON.parse(stdout) as Record<string, any>;
     const result = parsed.result ?? parsed;
-    return { state: result?.state, idle: result?.idle };
+    const agent = result?.agent ?? result;
+    const state = agent?.agent_status ?? agent?.state;
+    return { state, idle: typeof agent?.idle === "boolean" ? agent.idle : state === "idle" };
   } catch {
     return {};
   }
@@ -488,6 +507,7 @@ function writeState(task: TaskRecord, store: ArtifactStore): void {
     worktreePath: task.worktreePath,
     gateFailures: task.gateFailures,
     judgeFailures: task.judgeFailures,
+    error: task.error,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
   });
@@ -730,9 +750,40 @@ risk:
 
   store.write("task.md", `# Task ${task.taskId}\n\n## Original Request\n${task.originalRequest}\n`);
   const contract = parseContractYaml(text, task.originalRequest, 1);
+  presentPlanningSummary(task, contract, elapsed);
   writeSpecVersioned(store, 1, contract);
   store.write("spec-raw-v1.txt", text);
   return contract;
+}
+
+// ---------------------------------------------------------------------------
+// Controller plan visibility
+// ---------------------------------------------------------------------------
+
+/** Display the Controller's actionable plan, never its private reasoning. */
+function presentPlanningSummary(task: TaskRecord, contract: AcceptanceContract, elapsed: string): void {
+  const bullets = (items: string[], empty = "（未指定）") =>
+    items.length ? items.map((item) => `  • ${item}`).join("\n") : `  ${empty}`;
+  showText([
+    `## Dual-Gate · Controller 规划完成（${elapsed}s）`,
+    `任务：${task.taskId}`,
+    "",
+    `**目标**\n${contract.goal}`,
+    "",
+    `**相关组件**\n${bullets(contract.architecture.relevant_components)}`,
+    "",
+    `**约束**\n${bullets(contract.constraints)}`,
+    "",
+    `**预期结果**\n${bullets(contract.expected_outcome)}`,
+    "",
+    `**验收标准**\n${bullets(contract.acceptance_criteria)}`,
+    "",
+    `**验证计划**\n${bullets(contract.validation.required)}`,
+    "",
+    `**风险：${contract.risk.level}**\n${bullets(contract.risk.concerns, "无特别风险")}`,
+    "",
+    "接下来：将该契约交给 Executor 实现，并以 Gate + Judge 验收。",
+  ].join("\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -830,7 +881,11 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord): Prom
 
       // ---- Read the execution report ----
       const finalText = await herdrAgentRead({ target: task.herdrAgentName!, lines: 400 });
-      report = extractReportFromAgentMessage(finalText);
+      // Pi's alternate-screen scrollback may retain only the tail of a report.
+      // Prefer the executor's durable report when it was written, then fall
+      // back to the terminal transcript for older workers.
+      const durableReport = store.read("executor-report.yaml");
+      report = extractReportFromAgentMessage(durableReport || finalText);
       store.write("execution-report.yaml", JSON.stringify(report, null, 2));
       store.write(`execution-report-it${iteration}.yaml`, JSON.stringify(report, null, 2));
       store.write(`execution-report-raw-it${iteration}.md`, finalText);
@@ -1210,7 +1265,7 @@ async function spawnExecutor(ctx: ExtensionCommandContext, task: TaskRecord, con
       kind: "pi",
       pane: paneId,
       timeoutMs: 180_000,
-      args: [`--model=${config.executor.model}`, "--no-extensions"],
+      args: executorPiArgs(config.executor.model),
     });
     rt.manager.patch(task.taskId, { herdrAgentName: agentName, panelCreated: true });
 
@@ -1224,7 +1279,7 @@ async function spawnExecutor(ctx: ExtensionCommandContext, task: TaskRecord, con
       taskId: task.taskId,
       panelTitle,
     });
-    const send = await herdrAgentPrompt({ target: agentName, text: prompt, wait: false, timeoutMs: 120_000 });
+    const send = await herdrAgentPrompt({ target: agentName, text: prompt, wait: true, timeoutMs: 300_000 });
     if (!send.ok) {
       throw new Error(`agent prompt failed: ${send.error}`);
     }
@@ -1286,7 +1341,7 @@ async function recoverExecutor(
       kind: "pi",
       pane: paneId,
       timeoutMs: 180_000,
-      args: [`--model=${config.executor.model}`, "--no-extensions"],
+      args: executorPiArgs(config.executor.model),
     });
     rt.manager.patch(task.taskId, { herdrPanelId: paneId, herdrAgentName: agentName, panelCreated: true });
 
@@ -1331,7 +1386,7 @@ async function recoverExecutor(
 async function waitForExecutorCompletion(
   task: TaskRecord,
   config: ReturnType<typeof normalizeConfig>,
-  opts: { pollMs?: number; timeoutMs?: number; onTick?: (state: string) => void },
+  opts: { pollMs?: number; timeoutMs?: number; onTick?: (state: string) => void } = {},
 ): Promise<{ completed: boolean; state?: string; lost?: boolean }> {
   const agent = task.herdrAgentName;
   if (!agent) return { completed: false, lost: true };
@@ -1654,9 +1709,11 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
       return;
     }
 
-    if (rt.running || rt.manager.active()) return;
+    // A Dual-Gate task owns the next non-command input. Do not let the main
+    // Pi model execute it in parallel with the Controller/Executor workflow.
+    if (rt.running || rt.manager.active()) return { action: "handled" };
 
-    if ((globalThis as any).__dg_handling_input) return;
+    if ((globalThis as any).__dg_handling_input) return { action: "handled" };
     (globalThis as any).__dg_handling_input = true;
     try {
       const task = rt.manager.begin(text, {
@@ -1670,6 +1727,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     } finally {
       (globalThis as any).__dg_handling_input = false;
     }
+    return { action: "handled" };
   });
 
   const SUBCOMMANDS: Array<{ name: string; label: string; description: string }> = [

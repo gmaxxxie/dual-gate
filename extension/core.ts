@@ -348,6 +348,7 @@ export function buildExecutorPrompt(input: {
   const archLines = c.architecture.relevant_components.map((x) => `  - ${x}`).join("\n");
   const riskLines = c.risk.concerns.map((x) => `  - ${x}`).join("\n");
   const validationLines = c.validation.required.map((x) => `  - ${x}`).join("\n");
+  const durableReportPath = join(input.repoPath, ".pi", "dual-gate", input.taskId, "executor-report.yaml");
 
   let body = "";
   if (input.mode === "initial") {
@@ -421,7 +422,9 @@ unresolved:
 risks:
   - ...
 
-Do not include your internal chain-of-thought in the report. Be honest about failures.`;
+Do not include your internal chain-of-thought in the report. Be honest about failures.
+Before sending the final message, write the same YAML report to this file (create parent directories if needed):
+${durableReportPath}`;
   } else if (input.mode === "gate-fix") {
     body = `You are the Executor in a Dual-Gate workflow. Your previous work failed the deterministic gate.
 
