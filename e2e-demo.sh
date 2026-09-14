@@ -10,6 +10,27 @@ WORKDIR="$HOME"   # split cwd = main pane cwd (git-repo cwd panes get recycled)
 
 step() { printf '\n=== %s ===\n' "$1"; }
 
+# Robust wait: poll pane CONTENT for a completion marker (agent get returns
+# 'unknown' after a finished turn, so state polling is unreliable).
+wait_for_marker() {
+  local agent="$1" marker="$2" max="$3" i
+  for i in $(seq 1 "${max:-30}"); do
+    local out
+    out=$(HERDR_ENV=1 herdr agent read "$agent" --source recent-unwrapped --lines 300 2>/dev/null)
+    if echo "$out" | grep -qF "$marker"; then
+      echo "$out" > /tmp/dg-agent-read.txt
+      return 0
+    fi
+    # agent gone = pane/agent died
+    if ! HERDR_ENV=1 herdr agent get "$agent" >/dev/null 2>&1; then
+      return 2
+    fi
+    sleep 8
+  done
+  HERDR_ENV=1 herdr agent read "$agent" --source recent-unwrapped --lines 300 2>/dev/null > /tmp/dg-agent-read.txt
+  return 1
+}
+
 step "0/7 cleanup old agents"
 HERDR_ENV=1 herdr agent list 2>/dev/null | python3 -c "
 import json,sys
@@ -26,21 +47,21 @@ Produce an Acceptance Contract for this request in repo $REPO:
 REQUEST: 让 detectTabletMode 在键盘 detach(attached=false) 时返回 true，attach(true) 时返回 false，且不能破坏现有测试。
 Output ONLY a fenced YAML block with exactly: goal/context/architecture.relevant_components/constraints/expected_outcome/acceptance_criteria/validation.required/risk.level/risk.concerns" 2>/dev/null)
 echo "$CONTRACT" | head -4
-echo "  ✓ contract produced ($(echo "$CONTRACT" | wc -l) lines)"
+echo "  [OK] contract produced ($(echo "$CONTRACT" | wc -l) lines)"
 
 step "2/7 spawn visible DeepSeek pane (split right 40%)"
 P=$(HERDR_ENV=1 herdr pane split --current --direction right --cwd "$WORKDIR" --ratio 0.4 --no-focus 2>&1 | python3 -c "import json,sys; print(json.load(sys.stdin)['result']['pane']['pane_id'])")
 echo "  pane: $P"
 HERDR_ENV=1 herdr pane rename "$P" "DS · demo-rotate" >/dev/null 2>&1
 sleep 2
-if ! HERDR_ENV=1 herdr pane get "$P" >/dev/null 2>&1; then echo "  ✗ pane recycled"; exit 1; fi
-echo "  ✓ pane persistent"
+if ! HERDR_ENV=1 herdr pane get "$P" >/dev/null 2>&1; then echo "  [ERR] pane recycled"; exit 1; fi
+echo "  [OK] pane persistent"
 
 step "3/7 start DeepSeek executor in pane"
 AGENT="ds-e2e-$(date +%s | tail -c 5)"
 START=$(timeout 200 herdr agent start "$AGENT" --kind pi --pane "$P" --timeout 170000 -- --model "$EXECUTOR" --no-extensions 2>&1)
-if ! echo "$START" | grep -q agent_started; then echo "  ✗ agent start failed: $START" | head -2; exit 1; fi
-echo "  ✓ agent $AGENT started (idle, interactive_ready)"
+if ! echo "$START" | grep -q agent_started; then echo "  [ERR] agent start failed: $START" | head -2; exit 1; fi
+echo "  [OK] agent $AGENT started (idle, interactive_ready)"
 
 step "4/7 DeepSeek executes (visible, with tools)"
 TASK="REPOSITORY: $REPO
@@ -49,16 +70,15 @@ You are the Executor. Implement per the Controller contract:
 $CONTRACT
 
 Rules: explore the repo yourself, implement, run npm test, fix until green, do not commit.
-Finish with a fenced YAML Execution Report: status/summary/files_changed/tests/validation/acceptance_check."
-timeout 60 herdr agent prompt "$AGENT" "$TASK" --timeout 40000 >/dev/null 2>&1 || true
-# poll to idle (not --wait; it misreports on fast replies)
-for i in $(seq 1 30); do
-  ST=$(HERDR_ENV=1 herdr agent get "$AGENT" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print((d.get('result') or {}).get('agent_status') or (d.get('result') or {}).get('state') or 'unknown')" 2>/dev/null)
-  [ "$ST" = "idle" ] || [ "$ST" = "done" ] && break
-  sleep 8
-done
-echo "  ✓ executor finished (state=$ST)"
-HERDR_ENV=1 herdr agent read "$AGENT" --source recent-unwrapped --lines 200 > /tmp/dg-report1.txt
+Finish with a fenced YAML Execution Report: status/summary/files_changed/tests/validation/acceptance_check, then a final line containing exactly: EXEC-REPORT-END"
+timeout 60 herdr agent prompt "$AGENT" "$TASK" --wait --timeout 40000 >/dev/null 2>&1 || true
+# Wait for the completion marker in pane content (state polling is unreliable).
+if wait_for_marker "$AGENT" "EXEC-REPORT-END" 30; then
+  echo "  [OK] executor finished (content marker found)"
+else
+  echo "  [WARN] marker not found (exit=$?) - dumping last pane content"
+fi
+cp /tmp/dg-agent-read.txt /tmp/dg-report1.txt 2>/dev/null || true
 tail -6 /tmp/dg-report1.txt
 
 step "5/7 deterministic gate"
@@ -82,13 +102,9 @@ DELTA_MSG="The previous implementation is partially correct. Delta:
 - required: treat undefined as detached (return true), preserve true/false behavior
 - must_preserve: existing tests pass
 Fix only the gaps, rerun npm test, reply DELTA-DONE when green."
-timeout 60 herdr agent prompt "$AGENT" "$DELTA_MSG" --timeout 40000 >/dev/null 2>&1 || true
-for i in $(seq 1 30); do
-  ST=$(HERDR_ENV=1 herdr agent get "$AGENT" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print((d.get('result') or {}).get('agent_status') or 'unknown')" 2>/dev/null)
-  [ "$ST" = "idle" ] || [ "$ST" = "done" ] && break
-  sleep 8
-done
-HERDR_ENV=1 herdr agent read "$AGENT" --source recent-unwrapped --lines 100 > /tmp/dg-report2.txt
+timeout 60 herdr agent prompt "$AGENT" "$DELTA_MSG" --wait --timeout 40000 >/dev/null 2>&1 || true
+wait_for_marker "$AGENT" "DELTA-DONE" 30
+cp /tmp/dg-agent-read.txt /tmp/dg-report2.txt 2>/dev/null || true
 tail -5 /tmp/dg-report2.txt
 echo ""
 echo "=== FINAL REPO STATE ==="

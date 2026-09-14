@@ -1,4 +1,5 @@
 export function detectTabletMode(attached) {
-  // v1: naive — always false
-  return false;
+  // Tablet mode is active when the keyboard is detached.
+  // An unspecified/undefined attachment state is treated as detached.
+  return attached === undefined || attached === false;
 }
