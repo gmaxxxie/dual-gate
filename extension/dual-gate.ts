@@ -18,6 +18,13 @@ import type {
   ExtensionContext,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+
+// Structural match for pi-tui's AutocompleteItem (avoid adding a runtime dep).
+interface AutocompleteItem {
+  value: string;
+  label: string;
+  description?: string;
+}
 import type { Context as LlmContext, Message } from "@earendil-works/pi-ai";
 
 import {
@@ -1486,12 +1493,47 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     }
   });
 
+  const SUBCOMMANDS: Array<{ name: string; label: string; description: string }> = [
+    { name: "on", label: "Turn ON", description: "Enable Dual-Gate (default: off)" },
+    { name: "off", label: "Turn OFF", description: "Disable Dual-Gate, restore normal Pi" },
+    { name: "status", label: "Status", description: "Show current state (models, task, pane, session)" },
+    { name: "models", label: "Models", description: "Show current model configuration" },
+    { name: "controller", label: "Controller / Judge", description: "Pick the Controller/Judge model" },
+    { name: "executor", label: "Executor", description: "Pick the Executor model" },
+    { name: "thinking", label: "Thinking level", description: "Set Controller thinking level (minimal..max)" },
+    { name: "cancel", label: "Cancel task", description: "Cancel the active task, keep the pane" },
+    { name: "bypass", label: "Bypass next", description: "Next prompt uses normal Pi, then Dual-Gate resumes" },
+    { name: "cleanup", label: "Cleanup panes", description: "Close done Dual-Gate worker panes" },
+    { name: "help", label: "Help", description: "Show the full command list" },
+  ];
+
   pi.registerCommand("dual", {
     description: "Dual-Gate Orchestrator: on/off/status/models/thinking/controller/executor/cancel/bypass/cleanup",
+    getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
+      const p = (prefix ?? "").trim().split(/\s+/).filter(Boolean);
+      if (p.length > 1) return null; // only complete the first (subcommand) token
+      const q = p[0] ?? "";
+      const items: AutocompleteItem[] = SUBCOMMANDS.map((s) => ({
+        value: s.name,
+        label: s.label,
+        description: s.description,
+      }));
+      const filtered = items.filter((i) => i.value.startsWith(q));
+      return filtered.length > 0 ? filtered : null;
+    },
     handler: async (args, ctx) => {
       const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
-      const sub = (parts[0] ?? "").toLowerCase();
+      let sub = (parts[0] ?? "").toLowerCase();
       const rest = parts.slice(1);
+
+      // Bare `/dual` → interactive subcommand menu (like Pi's native pickers)
+      if (!sub) {
+        const labels = SUBCOMMANDS.map((s) => `${s.label} — ${s.description}`);
+        const chosen = await ctx.ui.select("Dual-Gate — pick an action:", labels);
+        if (!chosen) return;
+        sub = SUBCOMMANDS.find((s) => `${s.label} — ${s.description}` === chosen)?.name ?? "";
+        if (!sub) return;
+      }
 
       switch (sub) {
         case "on": {
