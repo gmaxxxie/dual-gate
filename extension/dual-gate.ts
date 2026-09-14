@@ -367,8 +367,12 @@ async function herdrPaneExists(paneId: string): Promise<boolean> {
 function executorPiArgs(model: string): string[] {
   // Keep all user extensions disabled to prevent recursive Dual-Gate tasks,
   // but explicitly retain Herdr's Pi state reporter so worker lifecycle can
-  // be observed reliably.
-  const args = ["--model", model, "--no-extensions"];
+  // be observed reliably. An empty model means "use the parent Pi's current
+  // model" (Executor=default), so no --model flag is passed at all.
+  const args = ["--no-extensions"];
+  if (model && model !== "default") {
+    args.unshift("--model", model);
+  }
   if (existsSync(HERDR_PI_STATE_EXTENSION_PATH)) {
     args.push("--extension", HERDR_PI_STATE_EXTENSION_PATH);
   }
@@ -559,11 +563,12 @@ function updateWidget(ctx: ExtensionContext): void {
     }
     const s = stateOf(task);
     const controller = resolveModelString(task.controllerModel);
-    const exec = resolveModelString(task.executorModel);
+    const execRaw = task.executorModel;
+    const executorLabel = execRaw === "default" ? "default（跟随主 Pi）" : (resolveModelString(execRaw)?.id ?? execRaw);
     const lines = [
       ctx.ui.theme.fg("accent", `dual-gate · ${s.symbol} ${s.label}`),
       ctx.ui.theme.fg("muted", `  it ${task.iteration} · spec v${task.expectedVersion} · ctl ${controller?.id ?? "?"}`),
-      ctx.ui.theme.fg("muted", `  exe ${exec?.id ?? "?"}${task.herdrPanelId ? ` · ${task.herdrPanelId}` : ""}`),
+      ctx.ui.theme.fg("muted", `  exe ${executorLabel}${task.herdrPanelId ? ` · ${task.herdrPanelId}` : ""}`),
     ];
     ctx.ui.setWidget("dual-gate", lines);
   } catch {
@@ -1203,7 +1208,11 @@ function sameGaps(a: JudgeOutput, b: JudgeOutput): boolean {
 async function spawnExecutor(ctx: ExtensionCommandContext, task: TaskRecord, config: ReturnType<typeof normalizeConfig>): Promise<void> {
   const rt = getRuntime();
   const registry = makeRegistry(ctx);
-  const executorRef = registry.find(config.executor.model) ?? { provider: "", id: config.executor.model, name: config.executor.model };
+  const configured = config.executor.model;
+  // Executor=default means the worker follows the parent Pi's current model:
+  // omit the --model flag when launching so pi uses its own default.
+  const executorLabel = configured === "default" ? "default（跟随主 Pi）" : (registry.find(configured)?.id ?? configured);
+  const executorModel = configured === "default" ? "default" : configured;
 
   // Preflight: dual-gate needs to run INSIDE a Herdr pane to split a new
   // executor pane. Outside Herdr this fails with a bare CLI error; give the
@@ -1219,7 +1228,7 @@ async function spawnExecutor(ctx: ExtensionCommandContext, task: TaskRecord, con
     return;
   }
 
-  ctx.ui.notify(`Dual-Gate: spawning Executor (${executorRef.id})…`, "info");
+  ctx.ui.notify(`Dual-Gate: spawning Executor (${executorLabel})…`, "info");
   setStatus(ctx, "dual-gate: spawning executor");
   rt.manager.patch(task.taskId, { state: "SPAWNING_EXECUTOR", currentStage: "spawning" });
   writeState(task, makeStore(task));
@@ -1265,7 +1274,7 @@ async function spawnExecutor(ctx: ExtensionCommandContext, task: TaskRecord, con
       kind: "pi",
       pane: paneId,
       timeoutMs: 180_000,
-      args: executorPiArgs(config.executor.model),
+      args: executorPiArgs(executorModel),
     });
     rt.manager.patch(task.taskId, { herdrAgentName: agentName, panelCreated: true });
 
@@ -1308,7 +1317,8 @@ async function recoverExecutor(
 ): Promise<boolean> {
   const rt = getRuntime();
   const registry = makeRegistry(ctx);
-  const executorRef = registry.find(config.executor.model) ?? { provider: "", id: config.executor.model, name: config.executor.model };
+  const configured = config.executor.model;
+  const executorModel = configured === "default" ? "default" : configured;
 
   try {
     // Old pane may still exist but be unusable; try to close it, ignore errors.
@@ -1341,7 +1351,7 @@ async function recoverExecutor(
       kind: "pi",
       pane: paneId,
       timeoutMs: 180_000,
-      args: executorPiArgs(config.executor.model),
+      args: executorPiArgs(executorModel),
     });
     rt.manager.patch(task.taskId, { herdrPanelId: paneId, herdrAgentName: agentName, panelCreated: true });
 
@@ -1853,7 +1863,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
               "  /dual status               current state",
               "  /dual models               model configuration",
               "  /dual controller [id]      pick controller model",
-              "  /dual executor [id]        pick executor model",
+              "  /dual executor [id|default]  pick executor model (default = follow main Pi)",
               "  /dual thinking [level]     thinking level (minimal..max)",
               "  /dual cancel               cancel active task",
               "  /dual bypass               next prompt runs on normal Pi",
@@ -1869,7 +1879,8 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
   async function showStatus(ctx: ExtensionCommandContext, rt: DgRuntime): Promise<void> {
     const config = rt.config;
     const ctl = resolveModelString(config.controller.model);
-    const exe = resolveModelString(config.executor.model);
+    const exeRaw = config.executor.model;
+    const exe = exeRaw === "default" ? null : resolveModelString(exeRaw);
     const task = rt.manager.active();
     const herdrOk = herdrAvailable();
     const lines: string[] = [];
@@ -1877,7 +1888,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
       lines.push("DUAL-GATE ON");
       lines.push(`Controller   ${ctl?.id ?? "?"}`);
       lines.push(`Thinking     ${config.controller.thinking}`);
-      lines.push(`Executor     ${exe?.id ?? "?"}`);
+      lines.push(`Executor     ${exe ? exe.id : "default（跟随主 Pi）"}`);
       lines.push("Herdr        " + (herdrOk ? "Ready" : "NOT DETECTED"));
       lines.push(`Config       ${CONFIG_PATH} (跨 session/项目持久化)`);
       if (task) {
@@ -1911,16 +1922,17 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
   async function showModels(ctx: ExtensionCommandContext, rt: DgRuntime): Promise<void> {
     const config = rt.config;
     const ctl = resolveModelString(config.controller.model);
-    const exe = resolveModelString(config.executor.model);
+    const exeRaw = config.executor.model;
+    const exe = exeRaw === "default" ? null : resolveModelString(exeRaw);
     const reg = makeRegistry(ctx);
     const ctlValid = reg.find(config.controller.model) ? "✓" : "⚠";
-    const exeValid = reg.find(config.executor.model) ? "✓" : "⚠";
+    const exeValid = exeRaw === "default" ? "✓" : reg.find(exeRaw) ? "✓" : "⚠";
     showText(
       [
         "Dual-Gate Models",
         `Controller / Judge  ${ctl?.id ?? "?"} ${ctlValid}`,
         `Thinking            ${config.controller.thinking}`,
-        `Executor            ${exe?.id ?? "?"} ${exeValid}`,
+        `Executor            ${exe ? exe.id : "default（跟随主 Pi）"} ${exeValid}`,
         "",
         "Set with:  /dual controller [id]   /dual executor [id]   /dual thinking [level]",
         "Available models come from the current Pi registry (ctx.modelRegistry).",
@@ -1953,6 +1965,12 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
   async function setExecutor(ctx: ExtensionCommandContext, rt: DgRuntime, rest: string[]): Promise<void> {
     if (rest.length > 0) {
       const spec = rest.join(" ");
+      if (spec.toLowerCase() === "default") {
+        rt.config.executor.model = "default";
+        saveConfig({ executor: { model: "default" } });
+        ctx.ui.notify("Executor → default（跟随主 Pi 当前模型）", "success");
+        return;
+      }
       const ref = makeRegistry(ctx).find(spec);
       if (!ref) {
         ctx.ui.notify(`Executor model not found: ${spec}`, "error");
@@ -1963,7 +1981,20 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
       ctx.ui.notify(`Executor → ${ref.id}（已保存，跨 session/项目生效）`, "success");
       return;
     }
-    const picked = await pickModel(ctx, makeRegistry(ctx), "Executor model:", "executor");
+    const registry = makeRegistry(ctx);
+    const labels = [
+      "default（跟随主 Pi 当前模型）",
+      ...registry.available().map((m) => `${m.provider}/${m.id}${m.name && m.name !== `${m.provider}/${m.id}` ? ` — ${m.name}` : ""}`),
+    ];
+    const chosen = await ctx.ui.select("Executor model:", labels);
+    if (!chosen) return;
+    if (chosen.startsWith("default")) {
+      rt.config.executor.model = "default";
+      saveConfig({ executor: { model: "default" } });
+      ctx.ui.notify("Executor → default（跟随主 Pi 当前模型）", "success");
+      return;
+    }
+    const picked = registry.available()[labels.indexOf(chosen) - 1];
     if (picked) {
       rt.config.executor.model = `${picked.provider}/${picked.id}`;
       saveConfig({ executor: { model: rt.config.executor.model } });
