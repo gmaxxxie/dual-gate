@@ -6,6 +6,20 @@
 
 ## 2026-09-15
 
+### 实测：三 pane 端到端跑通（DeepSeek 全家）
+
+用 `new-api/deepseek-v4-pro` 同时作主控/Controller/Judge、PM 与 Executor 完成真实端到端：
+PM 生成 WBS → 主控校验并展示 → 用户批准 → M1 实现（Executor pane）→ 收敛 → PM 里程碑反馈 → M2 → 最终 Gate → PM 产品验收 `accepted` → Controller ratification `accepted` → 项目 `ACCEPTED`，全部产物归档（`plan.yaml`、`milestone-<M>-feedback.yaml`、`product-acceptance.yaml`、`controller-ratification.yaml` 等）。
+
+**实测修复**：
+1. **PM IPC 改为产物文件**：Pi 的 alternate-screen 转录常截断 PM 输出，改为 PM 用被守卫的 `write` 工具把响应写入 `<prefix>-response.yaml`，主控以文件为准（`pm-write-guard.ts` 只允许写 PM 产物目录）。
+2. **宽容解析器支持同缩进块序列**：合法 YAML 的 `key:` 下顶层列表可与键同缩进，此前会被丢字段；现支持 `name`/`work_items`/`done_when`/`deliverables`/`exit_criteria` 等真实模型别名，依赖引用大小写归一化。
+3. **`parseJudgeOutput` 支持 JSON 产物**：judge 持久化为 JSON，宽容解析器读不出，导致项目端把已收敛里程碑误判 FAILED；补 JSON 兜底。
+4. **`waitForProductManagerResponse` 以产物文件为完成信号**，不再依赖易误报的 agent state。
+5. **Herdr pane cwd 用稳定非仓库目录**，避免 Git 检出 cwd 下 pane 被回收。
+
+新增 `extension/pm-write-guard.ts`；核心测试增至 60 项。
+
 ### 决定：大型项目的里程碑式分层规划（Milestone-driven）
 
 **背景**：当前 Dual-Gate 对大型项目只有一个"契约 → 一次 Executor → 一次 Judge"的闭环。

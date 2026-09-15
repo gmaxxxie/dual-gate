@@ -10,8 +10,9 @@
 // =============================================================================
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, renameSync } from "node:fs";
-import { join, resolve, basename } from "node:path";
+import { join, resolve, basename, dirname } from "node:path";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import type {
   ExtensionAPI,
@@ -390,8 +391,18 @@ function parseHerdrJson<T>(raw: string): { ok: boolean; result?: T; error?: stri
   }
 }
 
-async function herdrPaneSplit(opts: { direction: "right" | "down"; cwd: string; noFocus: boolean; ratio?: number }): Promise<string> {
+// Herdr can immediately recycle panes split with a Git-worktree cwd. The
+// Executor/PM always receive the repository explicitly in their prompts, so
+// start side panes from a stable non-repository shell location instead.
+function stableHerdrPaneCwd(): string {
+  return process.env.HOME || homedir() || process.cwd();
+}
+
+const PM_WRITE_GUARD_EXTENSION_PATH = join(dirname(fileURLToPath(import.meta.url)), "pm-write-guard.ts");
+
+async function herdrPaneSplit(opts: { direction: "right" | "down"; cwd: string; noFocus: boolean; ratio?: number; env?: Record<string, string> }): Promise<string> {
   const args = ["pane", "split", "--current", "--direction", opts.direction, "--cwd", opts.cwd];
+  for (const [key, value] of Object.entries(opts.env ?? {})) args.push("--env", `${key}=${value}`);
   if (opts.ratio !== undefined) args.push("--ratio", String(opts.ratio));
   if (opts.noFocus) args.push("--no-focus");
   const { code, stdout, stderr } = await exec("herdr", args, { timeoutMs: 30_000 });
@@ -422,7 +433,7 @@ function deriveProductManagerTitle(projectId: string, repoPath: string): string 
 
 /** PM deliberately gets only read-only Pi tools; all artifact writes stay in Main Pi. */
 function productManagerPiArgs(model: string): string[] {
-  return buildProductManagerPiArgs(model);
+  return buildProductManagerPiArgs(model, PM_WRITE_GUARD_EXTENSION_PATH);
 }
 
 function executorPiArgs(model: string): string[] {
@@ -1434,13 +1445,11 @@ async function spawnExecutor(ctx: ExtensionCommandContext, task: TaskRecord, con
   const agentName = deriveAgentName(task.taskId);
 
   try {
-    // 1. Split a new pane to the right of the caller pane.
-    //    --cwd uses the MAIN pane cwd (ctx.cwd), NOT the target repo: Herdr
-    //    recycles panes whose shell fails to come up in a git repo cwd (its
-    //    shell detection trips on git-aware prompts). The executor receives the
-    //    real REPOSITORY path in its prompt and cd's there itself.
+    // 1. Split from a stable non-repository cwd. Herdr can recycle panes whose
+    //    shell starts in a Git checkout; the Executor receives the real
+    //    REPOSITORY path in its prompt and changes there itself.
     //    --ratio: worker pane takes ~40% width by default (config.panel.ratio).
-    const splitCwd = ctx.cwd ?? cwd;
+    const splitCwd = stableHerdrPaneCwd();
     let paneId: string | null = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
       const candidate = await herdrPaneSplit({ direction: config.panel.direction, cwd: splitCwd, noFocus: true, ratio: config.panel.ratio });
@@ -1534,7 +1543,7 @@ async function recoverExecutor(
     const panelTitle = `${baseTitle} · recovered`;
     const agentName = (deriveAgentName(task.taskId) + "-r").slice(0, 31);
 
-    const splitCwd = ctx.cwd ?? cwd;
+    const splitCwd = stableHerdrPaneCwd();
     let paneId: string | null = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
       const candidate = await herdrPaneSplit({ direction: config.panel.direction, cwd: splitCwd, noFocus: true, ratio: config.panel.ratio });
@@ -1670,45 +1679,64 @@ async function spawnProductManager(ctx: ExtensionCommandContext, project: Projec
     model: config.product_manager.model, state: "STARTING", recoveryCount: 0,
   };
   project.productManager = pm;
-  if (pm.model !== "default" && !findAvailableAuthenticatedModel(makeRegistry(ctx), pm.model)) throw new Error(`Product Manager model is not available with configured authentication: ${pm.model}`);
+  // Resolve `default` once to the active Main Pi model. A Herdr child inherits
+  // terminal environment, not Pi's transient --model selection, so omitting
+  // --model here would not reliably follow the controller pane.
+  const model = pm.model === "default"
+    ? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "")
+    : pm.model;
+  if (!model || !findAvailableAuthenticatedModel(makeRegistry(ctx), model)) {
+    throw new Error(`Product Manager model is not available with configured authentication: ${model || "default"}`);
+  }
+  pm.model = model;
   const problem = herdrEnvironmentProblem();
   if (problem) throw new Error(problem);
   const title = deriveProductManagerTitle(project.projectId, project.repoPath);
   const name = deriveProductManagerName(project.projectId);
-  const splitCwd = ctx.cwd ?? project.repoPath;
+  const splitCwd = stableHerdrPaneCwd();
   let paneId: string | null = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const candidate = await herdrPaneSplit({ direction: config.panel.direction, cwd: splitCwd, noFocus: true, ratio: config.panel.ratio });
+    const candidate = await herdrPaneSplit({
+      direction: config.panel.direction,
+      cwd: splitCwd,
+      noFocus: true,
+      ratio: config.panel.ratio,
+      env: { DUAL_GATE_PM_ARTIFACT_DIR: productManagerStore(project).dir() },
+    });
     await sleep(1500);
     if (await herdrPaneExists(candidate)) { paneId = candidate; break; }
   }
   if (!paneId) throw new Error("failed to create a persistent Product Manager pane after 3 attempts");
   await exec("herdr", ["pane", "rename", paneId, title], { timeoutMs: 15_000 });
-  await herdrAgentStart({ name, kind: "pi", pane: paneId, timeoutMs: 180_000, args: productManagerPiArgs(pm.model) });
+  await herdrAgentStart({ name, kind: "pi", pane: paneId, timeoutMs: 180_000, args: productManagerPiArgs(model) });
   pm.paneId = paneId; pm.agentName = name; pm.state = "ACTIVE"; pm.error = undefined;
   writeProductManagerMetadata(project);
   ctx.ui.notify(`Dual-Gate: Product Manager ready in ${title}`, "info");
 }
 
-async function waitForProductManagerCompletion(project: ProjectRecord, timeoutMs = 10 * 60 * 1000): Promise<{ completed: boolean; lost?: boolean; state?: string }> {
+async function waitForProductManagerResponse(project: ProjectRecord, responsePath: string, timeoutMs = 10 * 60 * 1000): Promise<{ completed: boolean; lost?: boolean; state?: string }> {
   const agent = project.productManager?.agentName;
   if (!agent) return { completed: false, lost: true };
   const started = Date.now(); let missing = 0; let state = "unknown";
   while (Date.now() - started < timeoutMs) {
     if (project.status === "CANCELLED" || getRuntime().stopRequested) return { completed: false, state };
+    // The guarded response artifact, not a transient terminal state, is the
+    // IPC completion signal. This works for slow starts and alternate-screen
+    // Pi transcripts alike.
+    if (existsSync(responsePath) && readFileSync(responsePath, "utf8").trim()) return { completed: true, state };
     const current = await herdrAgentGet({ target: agent });
     if (!current.state && current.idle === undefined) {
       if (++missing >= 3) return { completed: false, lost: true, state };
     } else {
-      missing = 0; state = current.state ?? (current.idle ? "idle" : state);
-      if (state === "idle" || state === "done" || state === "blocked") return { completed: true, state };
+      missing = 0;
+      state = current.state ?? (current.idle ? "idle" : state);
     }
     await sleep(2000);
   }
   return { completed: false, state };
 }
 
-async function recoverProductManager(ctx: ExtensionCommandContext, project: ProjectRecord, config: ReturnType<typeof normalizeConfig>, requestId: string, request: unknown, originalPrompt: string): Promise<boolean> {
+async function recoverProductManager(ctx: ExtensionCommandContext, project: ProjectRecord, config: ReturnType<typeof normalizeConfig>, requestId: string, responsePath: string, request: unknown, originalPrompt: string): Promise<boolean> {
   const pm = project.productManager;
   if (!pm || pm.recoveryCount >= 1) return false;
   pm.recoveryCount++; pm.state = "RECOVERING";
@@ -1717,7 +1745,13 @@ async function recoverProductManager(ctx: ExtensionCommandContext, project: Proj
     if (pm.paneId) await herdrPaneClose(pm.paneId).catch(() => {});
     const title = `${deriveProductManagerTitle(project.projectId, project.repoPath)} · recovered`;
     const name = `${deriveProductManagerName(project.projectId)}-r`.slice(0, 31);
-    const paneId = await herdrPaneSplit({ direction: config.panel.direction, cwd: ctx.cwd ?? project.repoPath, noFocus: true, ratio: config.panel.ratio });
+    const paneId = await herdrPaneSplit({
+      direction: config.panel.direction,
+      cwd: stableHerdrPaneCwd(),
+      noFocus: true,
+      ratio: config.panel.ratio,
+      env: { DUAL_GATE_PM_ARTIFACT_DIR: productManagerStore(project).dir() },
+    });
     await sleep(1500);
     if (!await herdrPaneExists(paneId)) throw new Error("recovery PM pane was recycled");
     await exec("herdr", ["pane", "rename", paneId, title], { timeoutMs: 15_000 });
@@ -1725,7 +1759,7 @@ async function recoverProductManager(ctx: ExtensionCommandContext, project: Proj
     pm.paneId = paneId; pm.agentName = name; pm.state = "WAITING";
     const store = productManagerStore(project);
     const persistedFeedback = readdirSync(store.dir()).filter((name) => /^milestone-.*-feedback\.yaml$/.test(name)).map((name) => store.read(name)).filter(Boolean);
-    const recovery = buildProductManagerRecoveryPrompt({ projectId: project.projectId, requestId, outstandingRequest: { request, originalPrompt }, persistedPlan: store.read("plan.yaml"), persistedFeedback });
+    const recovery = buildProductManagerRecoveryPrompt({ projectId: project.projectId, requestId, responsePath, outstandingRequest: { request, originalPrompt }, persistedPlan: store.read("plan.yaml"), persistedFeedback });
     store.write("recovery-request.json", { requestId, request, recovery, at: new Date().toISOString() });
     writeProductManagerMetadata(project);
     const sent = await herdrAgentPrompt({ target: name, text: recovery, wait: false, timeoutMs: 120_000 });
@@ -1736,28 +1770,32 @@ async function recoverProductManager(ctx: ExtensionCommandContext, project: Proj
   }
 }
 
-async function requestProductManager<T>(ctx: ExtensionCommandContext, project: ProjectRecord, config: ReturnType<typeof normalizeConfig>, kind: "plan" | "milestone_feedback" | "final_acceptance", payload: Record<string, unknown>, promptFor: (requestId: string) => string, parse: (raw: string, requestId: string) => T | null): Promise<T> {
+async function requestProductManager<T>(ctx: ExtensionCommandContext, project: ProjectRecord, config: ReturnType<typeof normalizeConfig>, kind: "plan" | "milestone_feedback" | "final_acceptance", payload: Record<string, unknown>, promptFor: (requestId: string, responsePath: string) => string, parse: (raw: string, requestId: string) => T | null): Promise<T> {
   const pm = project.productManager;
   if (!pm?.agentName) throw new Error("Product Manager session is unavailable");
   const requestId = nextProductManagerRequestId(project);
-  const prompt = promptFor(requestId);
   const prefix = pmRequestPrefix(kind, payload);
   const store = productManagerStore(project);
+  const responsePath = join(store.dir(), `${prefix}-response.yaml`);
+  const prompt = promptFor(requestId, responsePath);
   // Persist before transport so an L1 recovery can replay exactly this request.
   pm.lastRequestId = requestId; pm.lastRequestKind = kind; pm.state = "WAITING";
-  store.write(`${prefix}-request.json`, { ...payload, protocol_version: 1, request_id: requestId, kind, prompt, at: new Date().toISOString() });
+  store.write(`${prefix}-request.json`, { ...payload, protocol_version: 1, request_id: requestId, kind, prompt, response_path: responsePath, at: new Date().toISOString() });
   writeProductManagerMetadata(project);
-  let sent = await herdrAgentPrompt({ target: pm.agentName, text: prompt, wait: false, timeoutMs: 120_000 });
+  const sent = await herdrAgentPrompt({ target: pm.agentName, text: prompt, wait: false, timeoutMs: 120_000 });
   if (!sent.ok) throw new Error(`Product Manager prompt failed: ${sent.error}`);
-  let wait = await waitForProductManagerCompletion(project);
+  let wait = await waitForProductManagerResponse(project, responsePath);
   if (wait.lost) {
-    const recovered = await recoverProductManager(ctx, project, config, requestId, payload, prompt);
+    const recovered = await recoverProductManager(ctx, project, config, requestId, responsePath, payload, prompt);
     if (!recovered) throw new Error("Product Manager session lost and recovery failed");
-    wait = await waitForProductManagerCompletion(project);
+    wait = await waitForProductManagerResponse(project, responsePath);
   }
   if (!wait.completed) throw new Error(`Product Manager ${wait.lost ? "session lost" : "timed out"}`);
-  const raw = await herdrAgentRead({ target: project.productManager?.agentName!, lines: 600 });
-  store.write(`${prefix}-response-raw.md`, raw);
+  const transcript = await herdrAgentRead({ target: project.productManager?.agentName!, lines: 600 });
+  store.write(`${prefix}-response-raw.md`, transcript);
+  // Pi's alternate-screen transcript can retain only a response tail. PM IPC
+  // therefore uses the guarded, durable response file as its source of truth.
+  const raw = store.read(`${prefix}-response.yaml`) ?? "";
   const result = parse(raw, requestId);
   if (!result) throw new Error(`Product Manager returned malformed or mismatched ${kind} response`);
   pm.state = "ACTIVE";
@@ -2157,9 +2195,12 @@ async function runProject(ctx: ExtensionCommandContext, request: string): Promis
     const controller = registry.find(config.controller.model) ?? { provider: "", id: config.controller.model, name: config.controller.model };
     // The PM is created once before WBS generation and persists through final acceptance.
     await spawnProductManager(ctx, project, config);
-    const plan = await requestProductManager(ctx, project, config, "plan", { source_request: request, repo_path: project.repoPath }, (requestId) => buildProductManagerPlanPrompt({ sourceRequest: request, repoPath: project.repoPath, requestId }), (raw, requestId) => {
-      const block = extractCorrelatedYamlBlock(raw, requestId, "plan");
-      try { return block ? parseProjectPlan(block) : null; } catch { return null; }
+    const plan = await requestProductManager(ctx, project, config, "plan", { source_request: request, repo_path: project.repoPath }, (requestId, responsePath) => buildProductManagerPlanPrompt({ sourceRequest: request, repoPath: project.repoPath, requestId, responsePath }), (raw, requestId) => {
+      try {
+        const block = extractCorrelatedYamlBlock(raw, requestId, "plan") ?? raw;
+        const plan = parseProjectPlan(block);
+        return plan;
+      } catch { return null; }
     });
     const ordered = topologicallyOrderMilestones(plan.milestones);
     project.orderedMilestoneIds = ordered.map((m) => m.id);
@@ -2211,7 +2252,7 @@ async function runProject(ctx: ExtensionCommandContext, request: string): Promis
         gate_summary: (taskStore.read("gate.log") ?? "").slice(0, 12000), unresolved: (record.unresolved ?? []).slice(0, 20).map((item) => item.slice(0, 1000)), deviations: (record.deviations ?? []).slice(0, 20).map((item) => item.slice(0, 1000)),
         artifact_refs: { taskArtifactDir: task.artifactDir, milestoneArtifactDir: milestoneStore.dir() },
       };
-      const pmFeedback = await requestProductManager(ctx, project, config, "milestone_feedback", feedbackBase as unknown as Record<string, unknown>, (requestId) => buildMilestoneCompletionFeedbackPrompt({ ...feedbackBase, request_id: requestId }), parseProductMilestoneFeedback);
+      const pmFeedback = await requestProductManager(ctx, project, config, "milestone_feedback", feedbackBase as unknown as Record<string, unknown>, (requestId, responsePath) => buildMilestoneCompletionFeedbackPrompt({ ...feedbackBase, request_id: requestId, response_path: responsePath }), parseProductMilestoneFeedback);
       const persistedFeedback = { ...feedbackBase, ...pmFeedback, request_id: project.productManager?.lastRequestId ?? "" };
       productManagerStore(project).write(`milestone-${milestone.id}-feedback.yaml`, persistedFeedback);
       if (pmFeedback.decision === "blocked") { project.status = "BLOCKED"; project.error = pmFeedback.reason; project.updatedAt = new Date().toISOString(); writeProjectState(project); break; }
@@ -2231,7 +2272,7 @@ async function runProject(ctx: ExtensionCommandContext, request: string): Promis
     const diff = await getDiff(project.repoPath);
     if (isProjectFinalizationStopped(project.status, rt.stopRequested)) return;
     const milestoneResults = ordered.map((m) => ({ milestoneId: m.id, title: m.title, summary: project.milestones[m.id].summary ?? "", verdict: project.milestones[m.id].verdict ?? "", unresolved: project.milestones[m.id].unresolved ?? [], deviations: project.milestones[m.id].deviations ?? [] }));
-    const productAcceptance = await requestProductManager(ctx, project, config, "final_acceptance", { plan, milestones: milestoneResults, gate_summary: formatGateResult(finalGate), diff }, (requestId) => buildProductAcceptancePrompt({ requestId, plan, milestones: milestoneResults, diff, gateSummary: formatGateResult(finalGate) }), parseProjectAcceptance);
+    const productAcceptance = await requestProductManager(ctx, project, config, "final_acceptance", { plan, milestones: milestoneResults, gate_summary: formatGateResult(finalGate), diff }, (requestId, responsePath) => buildProductAcceptancePrompt({ requestId, responsePath, plan, milestones: milestoneResults, diff, gateSummary: formatGateResult(finalGate) }), parseProjectAcceptance);
     if (isProjectFinalizationStopped(project.status, rt.stopRequested)) return;
     project.productAcceptance = productAcceptance; writeProjectState(project);
     const acceptanceRaw = await completeText(ctx, controller, "You are the final Controller ratifier. Output only the requested fenced YAML.", buildProjectAcceptancePrompt({ plan, milestones: milestoneResults, diff, gateSummary: formatGateResult(finalGate), productAcceptance }), { thinking: config.controller.thinking });

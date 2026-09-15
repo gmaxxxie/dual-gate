@@ -474,6 +474,14 @@ test("parseJudgeOutput invalid verdict returns null", () => {
   assert.equal(parseJudgeOutput("```yaml\nverdict: pass\n```"), null);
 });
 
+test("parseJudgeOutput accepts artifact JSON", () => {
+  const j = parseJudgeOutput(JSON.stringify({ verdict: "converged", confidence: "high", expected: ["e"], actual: ["a"], matched: ["m"], gaps: [], implementation_changes: [], spec_changes: [], spec_revision: { version: 2, changed: [], reason: [], evidence: [], user_intent_changed: false }, delta: { matched: ["m"], missing: [], incorrect: [], unexpected: [], required_changes: [], must_preserve: [] }, reason: "all good" }));
+  assert.equal(j?.verdict, "converged");
+  assert.deepEqual(j?.expected, ["e"]);
+  assert.deepEqual(j?.delta.matched, ["m"]);
+  assert.equal(parseJudgeOutput(JSON.stringify({ verdict: "nope" })), null);
+});
+
 // ---------------------------------------------------------------------------
 // 8. Contract parsing / spec revision
 // ---------------------------------------------------------------------------
@@ -731,6 +739,49 @@ test("project plan parses and orders stable WBS", () => {
   assert.deepEqual(validateProjectPlan(plan), []);
 });
 
+test("project plan tolerates real PM output: same-indent lists, name/work_items/done_when, case-insensitive deps", () => {
+  // Captured shape from a live DeepSeek PM: top-level block sequences at key
+  // indentation, `name` instead of `title`, work_items/done_when instead of
+  // expected_outcome/acceptance_criteria, and lowercase dependency refs.
+  const plan = parseProjectPlan(`goal: Add formatGreeting
+acceptance_criteria:
+  - exports both greeting and formatGreeting
+  - returns Hello, friend! for blank input
+  - README documents the API
+validation:
+  required:
+    - npm test passes
+milestones:
+  - id: milestone-1
+    name: Implement and test
+    depends_on: []
+    work_items:
+      - add formatGreeting to src/greeting.js
+      - keep greeting unchanged
+      - add focused tests
+    done_when:
+      - all behavior cases pass
+      - full suite passes
+  - id: milestone-2
+    name: Document and validate
+    depends_on: [milestone-1]
+    work_items:
+      - document formatGreeting in README
+    done_when:
+      - README documents usage
+      - npm test passes`);
+  assert.deepEqual(plan.milestones.map((m) => m.id), ["MILESTONE-1", "MILESTONE-2"]);
+  assert.equal(plan.milestones[0].title, "Implement and test");
+  assert.ok(plan.milestones[0].scope.components.length >= 2);
+  assert.ok(plan.milestones[0].expected_outcome.length >= 2);
+  assert.ok(plan.milestones[0].acceptance_criteria.length >= 2);
+  assert.ok(plan.validation.required.includes("npm test passes"));
+  // dependency reference case is normalized to the uppercased id
+  assert.deepEqual(plan.milestones[1].depends_on, ["MILESTONE-1"]);
+  assert.deepEqual(validateProjectPlan(plan), []);
+  assert.deepEqual(topologicallyOrderMilestones(plan.milestones).map((m) => m.id), ["MILESTONE-1", "MILESTONE-2"]);
+});
+
 test("project plan rejects missing fields, duplicate IDs, unknown/self/cyclic dependencies", () => {
   assert.throws(() => parseProjectPlan("goal: x\nacceptance_criteria: []\nvalidation:\n  required: []\nmilestones: []"), /Invalid project plan/);
   const plan = parseProjectPlan(projectYaml);
@@ -768,16 +819,17 @@ test("project prompts and optional milestone context preserve existing schemas",
   assert.ok(buildRecoveryPrompt({ taskId: "task-x", originalRequest: "request", contract, checkpoint: "x", repoPath: "/repo", delta: null, projectContext: context }).includes("MILESTONE: M1"));
 });
 
-test("PM protocol correlates the latest fenced response and uses a read-only launch", () => {
-  assert.deepEqual(productManagerPiArgs("default"), ["--no-extensions", "--tools", "read,grep,find,ls"]);
-  const args = productManagerPiArgs("provider/pm");
+test("PM protocol correlates the latest fenced response and uses a guarded artifact-only launch", () => {
+  assert.deepEqual(productManagerPiArgs("default", "/guard.ts"), ["--no-extensions", "--tools", "read,grep,find,ls,write", "--extension", "/guard.ts"]);
+  const args = productManagerPiArgs("provider/pm", "/guard.ts");
   assert.deepEqual(args.slice(0, 2), ["--model", "provider/pm"]);
-  assert.ok(args.includes("read,grep,find,ls"));
-  assert.ok(!args.join(" ").match(/\b(bash|edit|write)\b/));
+  assert.ok(args.includes("read,grep,find,ls,write"));
+  assert.ok(args.includes("/guard.ts"));
+  assert.ok(!args.join(" ").match(/\b(bash|edit)\b/));
   const stale = "```yaml\nprotocol_version: 1\nrequest_id: pm-x-2\nkind: plan\ngoal: stale\n```\n```yaml\nprotocol_version: 1\nrequest_id: pm-x-2\nkind: plan\ngoal: current\n```";
   assert.ok(extractCorrelatedYamlBlock(stale, "pm-x-2")?.includes("current"));
   assert.equal(extractCorrelatedYamlBlock(stale, "pm-x-3"), null);
-  const prompt = buildProductManagerPlanPrompt({ sourceRequest: "x", repoPath: "/repo", requestId: "pm-x-2" });
+  const prompt = buildProductManagerPlanPrompt({ sourceRequest: "x", repoPath: "/repo", requestId: "pm-x-2", responsePath: "/artifacts/plan.yaml" });
   const response = `\`\`\`yaml\nprotocol_version: 1\nrequest_id: pm-x-2\nkind: plan\n${projectYaml}\`\`\``;
   assert.ok(prompt.includes("never implement"));
   assert.ok(!prompt.includes("```yaml\nprotocol_version: 1\nrequest_id: pm-x-2"));
@@ -787,22 +839,22 @@ test("PM protocol correlates the latest fenced response and uses a read-only lau
 test("PM feedback and acceptance require matching protocol responses", () => {
   const feedback = "```yaml\nprotocol_version: 1\nrequest_id: pm-x-3\nkind: milestone_feedback\nmilestone_id: M1\ntask_id: task-1\ndecision: acknowledged\nsummary: reviewed\nunresolved: []\ndeviations: []\nreason: aligned\n```";
   assert.equal(parseProductMilestoneFeedback(feedback, "pm-x-3")?.decision, "acknowledged");
-  const feedbackPrompt = buildMilestoneCompletionFeedbackPrompt({ protocol_version: 1, request_id: "pm-x-3", kind: "milestone_feedback", milestone_id: "M1", task_id: "task-1", executor_summary: "done", judge: { verdict: "converged", gaps: [] }, gate_summary: "PASS", unresolved: [], deviations: [] });
+  const feedbackPrompt = buildMilestoneCompletionFeedbackPrompt({ protocol_version: 1, request_id: "pm-x-3", kind: "milestone_feedback", milestone_id: "M1", task_id: "task-1", executor_summary: "done", judge: { verdict: "converged", gaps: [] }, gate_summary: "PASS", unresolved: [], deviations: [], response_path: "/artifacts/feedback.yaml" });
   assert.ok(!feedbackPrompt.includes("```yaml\nprotocol_version: 1\nrequest_id: pm-x-3"));
   assert.equal(parseProductMilestoneFeedback(`${feedbackPrompt}\n${feedback}`, "pm-x-3")?.summary, "reviewed");
   assert.equal(parseProductMilestoneFeedback(feedback, "pm-x-4"), null);
   assert.equal(parseProductMilestoneFeedback("```yaml\nprotocol_version: 1\nrequest_id: pm-x-3\nkind: milestone_feedback\ndecision: maybe\n```", "pm-x-3"), null);
   const final = "```yaml\nprotocol_version: 1\nrequest_id: pm-x-4\nkind: final_acceptance\nverdict: accepted\nsummary: done\nsatisfied: []\ngaps: []\nunresolved: []\nreason: verified\n```";
   assert.equal(parseProjectAcceptance(final, "pm-x-4")?.verdict, "accepted");
-  const acceptancePrompt = buildProductAcceptancePrompt({ requestId: "pm-x-4", plan: parseProjectPlan(projectYaml), milestones: [], diff: "", gateSummary: "PASS" });
+  const acceptancePrompt = buildProductAcceptancePrompt({ requestId: "pm-x-4", responsePath: "/artifacts/acceptance.yaml", plan: parseProjectPlan(projectYaml), milestones: [], diff: "", gateSummary: "PASS" });
   assert.ok(!acceptancePrompt.includes("```yaml\nprotocol_version: 1\nrequest_id: pm-x-4"));
   assert.equal(parseProjectAcceptance(`${acceptancePrompt}\n${final}`, "pm-x-4")?.verdict, "accepted");
   assert.equal(parseProjectAcceptance(final, "pm-x-5"), null);
-  const recovery = buildProductManagerRecoveryPrompt({ projectId: "project-x", requestId: "pm-x-4", outstandingRequest: { kind: "final_acceptance" }, persistedFeedback: [] });
+  const recovery = buildProductManagerRecoveryPrompt({ projectId: "project-x", requestId: "pm-x-4", responsePath: "/artifacts/acceptance.yaml", outstandingRequest: { kind: "final_acceptance" }, persistedFeedback: [] });
   assert.ok(recovery.includes("pm-x-4"));
   assert.ok(!recovery.toLowerCase().includes("write source"));
-  assert.ok(buildMilestoneCompletionFeedbackPrompt({ protocol_version: 1, request_id: "pm-x-3", kind: "milestone_feedback", milestone_id: "M1", task_id: "task-1", executor_summary: "done", judge: { verdict: "converged", gaps: [] }, gate_summary: "PASS", unresolved: [], deviations: [] }).includes("acknowledged|blocked"));
-  assert.ok(buildProductAcceptancePrompt({ requestId: "pm-x-4", plan: parseProjectPlan(projectYaml), milestones: [], diff: "", gateSummary: "PASS" }).includes("read-only"));
+  assert.ok(buildMilestoneCompletionFeedbackPrompt({ protocol_version: 1, request_id: "pm-x-3", kind: "milestone_feedback", milestone_id: "M1", task_id: "task-1", executor_summary: "done", judge: { verdict: "converged", gaps: [] }, gate_summary: "PASS", unresolved: [], deviations: [], response_path: "/artifacts/feedback.yaml" }).includes("acknowledged|blocked"));
+  assert.ok(buildProductAcceptancePrompt({ requestId: "pm-x-4", responsePath: "/artifacts/acceptance.yaml", plan: parseProjectPlan(projectYaml), milestones: [], diff: "", gateSummary: "PASS" }).includes("RESPONSE PATH"));
 });
 
 test("project lifecycle only treats nonterminal states as active", () => {

@@ -89,7 +89,7 @@ Model IDs are **read from the current Pi registry**, never hardcoded. Defaults o
 | Controller / Judge | `openai-codex/gpt-5.6-sol` | GPT-5.6 Sol, via ChatGPT subscription backend (`opencode/*` has no auth, unusable) |
 | Controller thinking | `medium` | model supports mapping to medium |
 | Executor | `new-api/deepseek-v4-flash` | DeepSeek V4 Flash (local gateway, has auth) |
-| Product Manager | `default` | Project-only, follows the parent Pi model; read-only Herdr pane |
+| Product Manager | `default` | Project-only, follows the parent Pi model; read-only source access, response artifacts via a path-guarded write tool |
 
 Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual product-manager [id|default]`, `/dual thinking [level]`.
 
@@ -104,7 +104,7 @@ Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual product-m
 | `/dual models` | View current model config |
 | `/dual controller [id]` | Choose Controller/Judge model (no arg opens a selector) |
 | `/dual executor [id]` | Choose Executor model (no arg opens a selector) |
-| `/dual product-manager [id\|default]` | Choose the project-only read-only PM model |
+| `/dual product-manager [id\|default]` | Choose the project-only PM model (read-only source access) |
 | `/dual thinking [level]` | thinking: minimal/low/medium/high/xhigh/max |
 | `/dual cancel` | Cancel current task: stop orchestration, keep the pane (renamed `· CANCELLED`), don't delete code or reset git |
 | `/dual bypass` | Next user task goes through normal Pi, then Dual-Gate resumes |
@@ -143,7 +143,7 @@ Do not use project mode for trivial edits, independent chores, or work that cann
 
 ## Project mode (three panes)
 
-`/dual project <request>` is explicit: ordinary prompts remain unchanged. Project mode creates a persistent visible **PM** Herdr pane before WBS generation, alongside the main Controller/Judge pane and the current milestone Executor pane. The PM is read-only (`read,grep,find,ls`; no shell or write tools) and produces its WBS only through durable project artifacts. Main Pi validates and presents that WBS for explicit user approval, then remains sole owner of milestone contracts, task planning/control, Gate, Judge, persistence, and cancellation.
+`/dual project <request>` is explicit: ordinary prompts remain unchanged. Project mode creates a persistent visible **PM** Herdr pane before WBS generation, alongside the main Controller/Judge pane and the current milestone Executor pane. The PM has no shell/edit tools and only `read,grep,find,ls` plus a `write` tool guarded to its artifact directory (enforced by `pm-write-guard.ts`); it can never touch project source. It produces its WBS, milestone feedback, and product acceptance through those durable project artifacts. Main Pi validates and presents that WBS for explicit user approval, then remains sole owner of milestone contracts, task planning/control, Gate, Judge, persistence, and cancellation.
 
 Each milestone still uses the unchanged Executor → Gate → Judge loop. Once its persisted task has converged, Main sends the same PM a bounded durable completion handoff. A PM `blocked` handoff stops the project; malformed, timeout, or lost-PM failures fail closed. After all milestones, Main runs the final Gate, obtains mandatory PM product acceptance, then independently asks the Controller for ratification. `ACCEPTED` requires clear PM acceptance, clear Controller ratification, a final Gate pass, and every milestone converged with no unresolved items. PM panes remain for inspection unless `panel.on_complete` is `close` or `/dual cleanup` is run.
 

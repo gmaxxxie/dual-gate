@@ -89,7 +89,7 @@ cp -r extension ~/.pi/agent/extensions/dual-gate/
 | Controller / Judge | `openai-codex/gpt-5.6-sol` | GPT-5.6 Sol，经 ChatGPT 订阅后端（`opencode/*` 无 auth，不可用） |
 | Controller thinking | `medium` | 模型支持映射到 medium |
 | Executor | `new-api/deepseek-v4-flash` | DeepSeek V4 Flash（本地网关，有 auth） |
-| Product Manager | `default` | 仅项目模式；跟随主 Pi，使用只读 Herdr pane |
+| Product Manager | `default` | 仅项目模式；跟随主 Pi；只读源码，响应产物经路径受限的 write 工具写入 |
 
 可随时切换：`/dual controller [id]`、`/dual executor [id]`、`/dual product-manager [id|default]`、`/dual thinking [level]`。
 
@@ -104,7 +104,7 @@ cp -r extension ~/.pi/agent/extensions/dual-gate/
 | `/dual models` | 查看当前模型配置 |
 | `/dual controller [id]` | 选择 Controller/Judge 模型（无参数弹 selector） |
 | `/dual executor [id]` | 选择 Executor 模型（无参数弹 selector） |
-| `/dual product-manager [id\|default]` | 选择仅项目模式、只读的 PM 模型 |
+| `/dual product-manager [id\|default]` | 选择仅项目模式、源码只读的 PM 模型 |
 | `/dual thinking [level]` | thinking: minimal/low/medium/high/xhigh/max |
 | `/dual cancel` | 取消当前任务：停止编排、保留 pane（重命名 `· CANCELLED`）、不删代码不 reset git |
 | `/dual bypass` | 下一条用户任务走普通 Pi，之后恢复 Dual-Gate |
@@ -143,7 +143,7 @@ cp -r extension ~/.pi/agent/extensions/dual-gate/
 
 ## 项目模式（三 pane）
 
-`/dual project <request>` 是显式入口；普通输入仍走原有单任务闭环。项目开始前会创建持久、可见的 **PM** Herdr pane，与主 Controller/Judge pane 和当前里程碑 Executor pane 并存。PM 只读（`read,grep,find,ls`，无 shell 或写入工具），只通过持久项目产物提交 WBS；主 Pi 校验、展示并让用户显式批准，且始终独占里程碑契约、任务规划/控制、Gate、Judge、持久化和取消权。
+`/dual project <request>` 是显式入口；普通输入仍走原有单任务闭环。项目开始前会创建持久、可见的 **PM** Herdr pane，与主 Controller/Judge pane 和当前里程碑 Executor pane 并存。PM 无 shell/编辑工具，仅有 `read,grep,find,ls` 及一个被路径守卫（`pm-write-guard.ts`）限制到其产物目录的 `write` 工具，因此绝不可能改动项目源码；WBS、里程碑反馈与产品验收都经由这些持久产物提交。主 Pi 校验、展示并让用户显式批准，且始终独占里程碑契约、任务规划/控制、Gate、Judge、持久化和取消权。
 
 每个里程碑仍复用 Executor → Gate → Judge 闭环；其任务收敛并持久化后，主 Pi 向同一个 PM 发送有界、持久化的完成交接。PM 返回 `blocked` 会停止项目；PM 响应畸形、超时或会话丢失会 fail closed。全部里程碑后，主 Pi 先跑最终 Gate，再取得强制的 PM 产品验收，最后进行 Controller 独立 ratification。只有 PM 与 Controller 都 `accepted` 且无 gaps/unresolved、最终 Gate 通过、所有里程碑无 unresolved 地收敛，项目才会 `ACCEPTED`。默认保留 PM pane 供检查；`panel.on_complete: close` 或 `/dual cleanup` 才关闭。
 

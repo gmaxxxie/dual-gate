@@ -989,6 +989,49 @@ export function parseTolerantYaml(text: string): Record<string, unknown> | null 
     let mode: "map" | "list" | null = null;
     let lastKey: string | null = null;
 
+    // YAML permits a block sequence at the same indentation as its parent key
+    // (e.g. `acceptance_criteria:` followed directly by `- item` at indent 0).
+    // Parse such a run into an array and return the next line index.
+    function parseSameIndentList(start: number, indentLevel: number): { value: unknown[]; next: number } {
+      const out: unknown[] = [];
+      let j = start;
+      while (j < lines.length) {
+        const line = lines[j];
+        const trimmed = line.trim();
+        const itemIndent = indentOf(line);
+        if (!trimmed || trimmed.startsWith("#") || trimmed === "---" || trimmed === "...") { j++; continue; }
+        if (itemIndent !== indentLevel || !(trimmed.startsWith("- ") || trimmed === "-")) break;
+        const itemText = trimmed === "-" ? "" : trimmed.slice(2).trim();
+        if (itemText === "") {
+          const child = parseBlock(j + 1, indentLevel + 2);
+          out.push(child.value);
+          j = child.next;
+        } else {
+          const header = itemText.match(/^([A-Za-z0-9_.\-]+)\s*:\s*(.*)$/);
+          if (header) {
+            const key = header[1];
+            const rest = header[2].trim();
+            if (rest === "") {
+              const obj: Record<string, unknown> = {};
+              out.push(obj);
+              if (j + 1 < lines.length && indentOf(lines[j + 1]) > indentLevel + 2) {
+                const child = parseBlock(j + 1, indentOf(lines[j + 1]));
+                Object.assign(obj, child.value as Record<string, unknown>);
+                j = child.next;
+              } else { j++; }
+            } else {
+              out.push({ [key]: scalar(rest) });
+              j++;
+            }
+          } else {
+            out.push(scalar(itemText));
+            j++;
+          }
+        }
+      }
+      return { value: out, next: j };
+    }
+
     while (i < lines.length) {
       const line = lines[i];
       const trimmed = line.trim();
@@ -1022,8 +1065,17 @@ export function parseTolerantYaml(text: string): Record<string, unknown> | null 
       }
 
       if (trimmed.startsWith("- ") || trimmed === "-") {
-        if (mode === null) mode = "list";
-        else if (mode !== "list") break;
+        if (mode === null) {
+          mode = "list";
+        } else if (mode === "map" && lastKey && ind === indent) {
+          // Block sequence at the same indent as the parent key.
+          const same = parseSameIndentList(i, ind);
+          map[lastKey] = same.value;
+          i = same.next;
+          continue;
+        } else if (mode !== "list") {
+          break;
+        }
         const itemText = trimmed === "-" ? "" : trimmed.slice(2).trim();
         if (itemText === "") {
           const child = parseBlock(i + 1, ind + 2);
@@ -1154,7 +1206,15 @@ export function extractReportFromAgentMessage(message: string): Record<string, u
 export function parseJudgeOutput(text: string): JudgeOutput | null {
   const block = extractYamlBlock(text);
   const parsed = block ? parseTolerantYaml(block) : null;
-  const src = parsed ?? parseTolerantYaml(text);
+  // Artifacts store the Judge result as JSON, not YAML. The tolerant parser
+  // cannot read that shape, so fall back to strict JSON before rejecting.
+  let src = parsed ?? parseTolerantYaml(text);
+  if (!src || !Object.keys(src).length) {
+    try {
+      const v = JSON.parse(text.trim());
+      src = v && typeof v === "object" ? v as Record<string, unknown> : null;
+    } catch { src = null; }
+  }
   if (!src) return null;
   const arr = (v: unknown): string[] => (Array.isArray(v) ? v.map((x) => String(x)) : typeof v === "string" && v.trim() ? [v.trim()] : []);
   const verdict =
@@ -1267,16 +1327,20 @@ export function parseProjectPlan(text: string): ProjectPlan {
   const yaml = (block ?? text).replace(/^(?:protocol_version|request_id|kind):[^\n]*\n/gm, "");
   const raw = parseTolerantYaml(yaml);
   if (!raw) throw new Error("Project plan is not valid YAML");
+  const projectValidation = raw.validation && typeof raw.validation === "object" ? raw.validation as Record<string, unknown> : {};
   const milestonesRaw = Array.isArray(raw.milestones) ? raw.milestones : [];
   const milestones: Milestone[] = milestonesRaw.map((value) => {
     const m = value && typeof value === "object" ? value as Record<string, unknown> : {};
     const scope = m.scope && typeof m.scope === "object" ? m.scope as Record<string, unknown> : {};
     const validation = m.validation && typeof m.validation === "object" ? m.validation as Record<string, unknown> : {};
     const risk = m.risk && typeof m.risk === "object" ? m.risk as Record<string, unknown> : {};
-    return { id: projectString(m.id), title: projectString(m.title), depends_on: projectStrings(m.depends_on), scope: { files: projectStrings(scope.files), components: projectStrings(scope.components) }, expected_outcome: projectStrings(m.expected_outcome), acceptance_criteria: projectStrings(m.acceptance_criteria), validation: { required: projectStrings(validation.required ?? m.validation) }, risk: { level: projectRisk(risk.level), concerns: projectStrings(risk.concerns) } };
+    // Accept concise WBS variants from a PM while normalizing them into the
+    // executor's stricter milestone contract: a list-valued scope describes
+    // components, deliverables are expected outcomes, and project validation
+    // is inherited when the milestone omits an equivalent command list.
+    return { id: projectString(m.id).toUpperCase(), title: projectString(m.title ?? m.name), depends_on: projectStrings(m.depends_on).map((dep) => dep.toUpperCase()), scope: { files: projectStrings(scope.files), components: projectStrings(scope.components).concat(projectStrings(m.scope), projectStrings(m.tasks), projectStrings(m.work_items)) }, expected_outcome: projectStrings(m.expected_outcome ?? m.deliverables ?? m.tasks ?? m.work_items), acceptance_criteria: projectStrings(m.acceptance_criteria ?? m.completion_criteria ?? m.exit_criteria ?? m.done_when), validation: { required: projectStrings(validation.required ?? m.validation ?? projectValidation.required) }, risk: { level: projectRisk(risk.level), concerns: projectStrings(risk.concerns) } };
   });
-  const validation = raw.validation && typeof raw.validation === "object" ? raw.validation as Record<string, unknown> : {};
-  const plan: ProjectPlan = { version: typeof raw.version === "number" ? raw.version : 1, goal: projectString(raw.goal), context: projectString(raw.context), constraints: projectStrings(raw.constraints), acceptance_criteria: projectStrings(raw.acceptance_criteria), validation: { required: projectStrings(validation.required ?? raw.validation) }, milestones };
+  const plan: ProjectPlan = { version: typeof raw.version === "number" ? raw.version : 1, goal: projectString(raw.goal), context: projectString(raw.context), constraints: projectStrings(raw.constraints), acceptance_criteria: projectStrings(raw.acceptance_criteria), validation: { required: projectStrings(projectValidation.required ?? raw.validation) }, milestones };
   const errors = validateProjectPlan(plan);
   if (errors.length) throw new Error(`Invalid project plan: ${errors.join("; ")}`);
   return plan;
@@ -1301,8 +1365,10 @@ export function milestoneToAcceptanceContract(plan: ProjectPlan, milestone: Mile
 }
 
 /** Read-only PM process arguments. Exported here to keep launch policy unit-testable. */
-export function productManagerPiArgs(model: string): string[] {
-  const args = ["--no-extensions", "--tools", "read,grep,find,ls"];
+export function productManagerPiArgs(model: string, writeGuardExtensionPath: string): string[] {
+  // PM may write only its response artifacts. The explicitly loaded guard
+  // enforces that boundary; no shell or edit tool is granted.
+  const args = ["--no-extensions", "--tools", "read,grep,find,ls,write", "--extension", writeGuardExtensionPath];
   if (model && model !== "default") args.unshift("--model", model);
   return args;
 }
@@ -1318,25 +1384,25 @@ export function extractCorrelatedYamlBlock(text: string, requestId: string, expe
   return latest;
 }
 
-export function buildProductManagerPlanPrompt(input: { sourceRequest: string; repoPath: string; requestId: string }): string {
-  return `You are the read-only Product Manager for a Dual-Gate project. Produce a WBS only; never implement, edit, create, delete, or propose direct source edits. Your response is captured by the main Pi, which is the only writer of durable artifacts. Do not use any write-capable action.\n\nREPOSITORY: ${input.repoPath}\nREQUEST: ${input.sourceRequest}\n\nReturn ONLY one fenced YAML response. It MUST include protocol_version: 1, request_id: ${input.requestId}, kind: plan, followed by the complete Project Plan schema below. Every milestone must be dependency ordered and scoped.\n\n\`\`\`yaml\nprotocol_version: 1\nrequest_id: <the request_id above>\nkind: plan\ngoal: ...\ncontext: ...\nconstraints: [...]\nacceptance_criteria: [...]\nvalidation: { required: [...] }\nmilestones: [...]\n\`\`\``;
+export function buildProductManagerPlanPrompt(input: { sourceRequest: string; repoPath: string; requestId: string; responsePath: string }): string {
+  return `You are the Product Manager for a Dual-Gate project. Produce a WBS only; never implement, edit, create, delete, or propose direct source edits. You may write exactly one response artifact at RESPONSE PATH; an enforced tool guard blocks every write outside the Product Manager artifact directory.\n\nREPOSITORY: ${input.repoPath}\nREQUEST: ${input.sourceRequest}\nRESPONSE PATH: ${input.responsePath}\n\nWrite exactly one YAML document to RESPONSE PATH, then reply briefly that it was written. The YAML MUST include protocol_version: 1, request_id: ${input.requestId}, kind: plan, followed by the complete Project Plan schema below. Every milestone must be dependency ordered and scoped. Use only simple one-line scalars and YAML lists: never use folded/literal block scalars (greater-than or pipe style), anchors, or multi-line values.\n\n\`\`\`yaml\nprotocol_version: 1\nrequest_id: <the request_id above>\nkind: plan\ngoal: ...\ncontext: ...\nconstraints: [...]\nacceptance_criteria: [...]\nvalidation: { required: [...] }\nmilestones: [...]\n\`\`\``;
 }
 
-export function buildMilestoneCompletionFeedbackPrompt(input: ProjectMilestoneFeedback): string {
-  return `You are the read-only Product Manager. Record the product consequence of this completed milestone; do not edit source files or write artifacts. The main Pi persists this transcript. REQUEST ID: ${input.request_id}. Return ONLY the correlated fenced YAML response.\n\nCOMPLETION HANDOFF:\n${JSON.stringify(input, null, 2)}\n\n\`\`\`yaml\nprotocol_version: 1\nrequest_id: <the request_id above>\nkind: milestone_feedback\nmilestone_id: <the milestone_id from the handoff>\ntask_id: <the task_id from the handoff>\ndecision: acknowledged|blocked\nsummary: ...\nunresolved: []\ndeviations: []\nreason: ...\n\`\`\``;
+export function buildMilestoneCompletionFeedbackPrompt(input: ProjectMilestoneFeedback & { response_path: string }): string {
+  return `You are the Product Manager. Record the product consequence of this completed milestone; never edit source files. You may write exactly one YAML response to RESPONSE PATH; an enforced guard blocks every other write. REQUEST ID: ${input.request_id}. RESPONSE PATH: ${input.response_path}. Write the YAML there, then reply briefly that it was written.\n\nCOMPLETION HANDOFF:\n${JSON.stringify(input, null, 2)}\n\n\`\`\`yaml\nprotocol_version: 1\nrequest_id: <the request_id above>\nkind: milestone_feedback\nmilestone_id: <the milestone_id from the handoff>\ntask_id: <the task_id from the handoff>\ndecision: acknowledged|blocked\nsummary: ...\nunresolved: []\ndeviations: []\nreason: ...\n\`\`\``;
 }
 
-export function buildProductAcceptancePrompt(input: { requestId: string; plan: ProjectPlan; milestones: unknown[]; diff: string; gateSummary: string }): string {
-  return `You are the read-only Product Manager issuing the mandatory product-level acceptance input. Do not edit source files or write artifacts. Verify the approved WBS, all durable milestone outcomes, final gate, and aggregate diff. REQUEST ID: ${input.requestId}. Return ONLY the correlated fenced YAML response.\n\nPROJECT PLAN:\n${JSON.stringify(input.plan, null, 2)}\n\nMILESTONES:\n${JSON.stringify(input.milestones, null, 2)}\n\nFINAL GATE:\n${input.gateSummary}\n\nAGGREGATE DIFF:\n${input.diff.slice(0, 30000)}\n\n\`\`\`yaml\nprotocol_version: 1\nrequest_id: <the request_id above>\nkind: final_acceptance\nverdict: accepted|gaps|blocked\nsummary: ...\nsatisfied: []\ngaps: []\nunresolved: []\nreason: ...\n\`\`\``;
+export function buildProductAcceptancePrompt(input: { requestId: string; responsePath: string; plan: ProjectPlan; milestones: unknown[]; diff: string; gateSummary: string }): string {
+  return `You are the Product Manager issuing the mandatory product-level acceptance input. Never edit source files. You may write exactly one YAML response to RESPONSE PATH; an enforced guard blocks every other write. Verify the approved WBS, all durable milestone outcomes, final gate, and aggregate diff. REQUEST ID: ${input.requestId}. RESPONSE PATH: ${input.responsePath}. Write the YAML there, then reply briefly that it was written.\n\nPROJECT PLAN:\n${JSON.stringify(input.plan, null, 2)}\n\nMILESTONES:\n${JSON.stringify(input.milestones, null, 2)}\n\nFINAL GATE:\n${input.gateSummary}\n\nAGGREGATE DIFF:\n${input.diff.slice(0, 30000)}\n\n\`\`\`yaml\nprotocol_version: 1\nrequest_id: <the request_id above>\nkind: final_acceptance\nverdict: accepted|gaps|blocked\nsummary: ...\nsatisfied: []\ngaps: []\nunresolved: []\nreason: ...\n\`\`\``;
 }
 
-export function buildProductManagerRecoveryPrompt(input: { projectId: string; requestId: string; outstandingRequest: unknown; persistedPlan?: unknown; persistedFeedback?: unknown[] }): string {
-  return `You are a recovered read-only Product Manager for project ${input.projectId}. Do not edit source files and do not write any artifact; the main Pi owns persistence. Reissue exactly one response for the outstanding request ID ${input.requestId}; do not invent a new request ID.\n\nPERSISTED PLAN:\n${JSON.stringify(input.persistedPlan ?? null, null, 2)}\n\nPERSISTED FEEDBACK:\n${JSON.stringify(input.persistedFeedback ?? [], null, 2)}\n\nOUTSTANDING REQUEST:\n${JSON.stringify(input.outstandingRequest, null, 2)}`;
+export function buildProductManagerRecoveryPrompt(input: { projectId: string; requestId: string; responsePath: string; outstandingRequest: unknown; persistedPlan?: unknown; persistedFeedback?: unknown[] }): string {
+  return `You are a recovered Product Manager for project ${input.projectId}. Never edit source files. Reissue exactly one response for outstanding request ID ${input.requestId} at RESPONSE PATH ${input.responsePath}; do not invent a new request ID. The enforced guard permits writes only inside your artifact directory.\n\nPERSISTED PLAN:\n${JSON.stringify(input.persistedPlan ?? null, null, 2)}\n\nPERSISTED FEEDBACK:\n${JSON.stringify(input.persistedFeedback ?? [], null, 2)}\n\nOUTSTANDING REQUEST:\n${JSON.stringify(input.outstandingRequest, null, 2)}`;
 }
 
 export function parseProductMilestoneFeedback(text: string, requestId: string): ProjectMilestoneFeedback | null {
-  const block = extractCorrelatedYamlBlock(text, requestId);
-  const raw = block ? parseTolerantYaml(block) : null;
+  const block = extractCorrelatedYamlBlock(text, requestId) ?? text;
+  const raw = parseTolerantYaml(block);
   if (!raw || raw.kind !== "milestone_feedback" || raw.protocol_version !== 1 || raw.request_id !== requestId) return null;
   if (raw.decision !== "acknowledged" && raw.decision !== "blocked") return null;
   const milestone_id = projectString(raw.milestone_id);
@@ -1352,7 +1418,7 @@ export function buildProjectAcceptancePrompt(input: { plan: ProjectPlan; milesto
 }
 
 export function parseProjectAcceptance(text: string, requestId?: string): ProjectAcceptance | null {
-  const block = requestId ? extractCorrelatedYamlBlock(text, requestId) : extractYamlBlock(text);
+  const block = requestId ? (extractCorrelatedYamlBlock(text, requestId) ?? text) : extractYamlBlock(text);
   const raw = parseTolerantYaml(block ?? text);
   if (!raw || (requestId && (raw.protocol_version !== 1 || raw.request_id !== requestId || raw.kind !== "final_acceptance")) || (raw.verdict !== "accepted" && raw.verdict !== "gaps" && raw.verdict !== "blocked")) return null;
   const summary = projectString(raw.summary);
