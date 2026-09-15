@@ -1183,14 +1183,15 @@ export function parseTolerantYaml(text: string): Record<string, unknown> | null 
           map[key] = "";
           i++;
         }
-      } else if (rest === "|" || rest === ">") {
+      } else if (/^[|>][+-]?$/.test(rest)) {
         const block: string[] = [];
         i++;
         while (i < lines.length && indentOf(lines[i]) > ind) {
           block.push(lines[i].trim());
           i++;
         }
-        map[key] = block.join("\n");
+        // `>` folds newlines into spaces; `|` preserves them.
+        map[key] = rest.startsWith(">") ? block.join(" ") : block.join("\n");
       } else if (rest === "[]") {
         map[key] = [];
         i++;
@@ -1221,7 +1222,7 @@ export function normalizeReport(raw: Record<string, unknown> | null): Record<str
   // empty unresolved/deviations list does not block convergence.
   const clean = (v: unknown): string => {
     const s = str(v).trim().toLowerCase();
-    return s === "none" || s === "null" || s === "n/a" || s === "-" || s === "[]" || s === "" ? "" : str(v);
+    return s === "none" || s === "null" || s === "n/a" || s === "-" || s === "[]" || s === "{}" || s === "" ? "" : str(v);
   };
   const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : typeof v === "string" && v.trim() ? [{ path: v, purpose: v }] : []);
   const strArr = (v: unknown): string[] => arr(v).map((x) => (typeof x === "string" ? x : JSON.stringify(x))).map(clean).filter(Boolean);
@@ -1388,6 +1389,15 @@ export function parseProjectPlan(text: string): ProjectPlan {
   if (!raw) throw new Error("Project plan is not valid YAML");
   const projectValidation = raw.validation && typeof raw.validation === "object" ? raw.validation as Record<string, unknown> : {};
   const milestonesRaw = Array.isArray(raw.milestones) ? raw.milestones : [];
+  // A PM may degrade to a bare list of strings (no id/title/scope objects).
+  // Fail safe: collapse into a single serial milestone whose scope/outcome is
+  // the full list, preserving the research decision and project acceptance.
+  if (milestonesRaw.length && milestonesRaw.every((v) => typeof v === "string")) {
+    const items = milestonesRaw.map((s) => String(s));
+    const goal = projectString(raw.goal) || "Project";
+    milestonesRaw.length = 0;
+    milestonesRaw.push({ id: "M1", title: goal.slice(0, 60) || "Project", depends_on: [], scope: items, expected_outcome: items, acceptance_criteria: items, validation: projectValidation.required ? { required: projectStrings(projectValidation.required) } : {} });
+  }
   const milestones: Milestone[] = milestonesRaw.map((value) => {
     const m = value && typeof value === "object" ? value as Record<string, unknown> : {};
     const scope = m.scope && typeof m.scope === "object" ? m.scope as Record<string, unknown> : {};
@@ -1397,14 +1407,51 @@ export function parseProjectPlan(text: string): ProjectPlan {
     // executor's stricter milestone contract: a list-valued scope describes
     // components, deliverables are expected outcomes, and project validation
     // is inherited when the milestone omits an equivalent command list.
-    const scopeItems = projectStrings(scope.components).concat(projectStrings(m.scope), projectStrings(m.tasks), projectStrings(m.work_items), projectStrings(m.objective));
+    const scopeItems = projectStrings(scope.components).concat(projectStrings(m.scope), projectStrings(m.tasks), projectStrings(m.work_items), projectStrings(m.objective), projectStrings(m.description), projectStrings(m.deliverables), projectStrings(m.done_when));
     const fileItems = projectStrings(scope.files).concat(projectStrings(m.files_touched), projectStrings(m.files));
     const outcome = projectStrings(m.expected_outcome ?? m.deliverables ?? m.tasks ?? m.work_items ?? m.objective ?? m.validation);
     const acceptance = projectStrings(m.acceptance_criteria ?? m.acceptance ?? m.completion_criteria ?? m.exit_criteria ?? m.done_when ?? m.deliverables ?? m.verification ?? m.validation);
     const milestoneValidation = projectStrings(m.validation?.required ?? (m.validation && typeof m.validation === "object" ? undefined : m.validation) ?? m.verification);
-    return { id: projectString(m.id).toUpperCase(), title: projectString(m.title ?? m.name ?? m.id), depends_on: projectStrings(m.depends_on ?? m.dependencies).map((dep) => dep.toUpperCase()), scope: { files: fileItems, components: scopeItems }, expected_outcome: outcome.length ? outcome : scopeItems, acceptance_criteria: acceptance.length ? acceptance : fileItems.length ? fileItems : scopeItems, validation: { required: milestoneValidation.length ? milestoneValidation : projectStrings(projectValidation.required) }, risk: { level: projectRisk(risk.level), concerns: projectStrings(risk.concerns) } };
+    const rawId = projectString(m.id ?? m.key);
+    const rawName = projectString(m.title ?? m.name ?? rawId);
+    // Some PMs omit `id` and reference milestones by name/title in depends_on.
+    // Derive a stable slug id from the name when no explicit id is present.
+    const id = rawId && /^[A-Za-z0-9._-]+$/.test(rawId) ? rawId.toUpperCase() : (rawName || "M").toUpperCase().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "M";
+    // Keep the original raw name for depends_on resolution below.
+    return { id, title: rawName, depends_on: projectStrings(m.depends_on ?? m.dependencies).map((dep) => dep.toUpperCase()), scope: { files: fileItems, components: scopeItems }, expected_outcome: outcome.length ? outcome : scopeItems, acceptance_criteria: acceptance.length ? acceptance : fileItems.length ? fileItems : scopeItems, validation: { required: milestoneValidation.length ? milestoneValidation : projectStrings(projectValidation.required) }, risk: { level: projectRisk(risk.level), concerns: projectStrings(risk.concerns) } };
   });
+  // Resolve depends_on references that used milestone names/titles instead of
+  // ids (models sometimes reference by display name): map each reference to
+  // the id whose title/name normalizes to it, else keep as-is (validation will
+  // report unknown refs). References may be quoted flow strings, slug ids, or
+  // space-separated names — normalize both sides the same way.
+  const idByTitle = new Map<string, string>();
+  for (const m of milestones) {
+    const norm = m.title.toUpperCase().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+    if (norm) idByTitle.set(norm, m.id);
+    idByTitle.set(m.id.toUpperCase().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, ""), m.id);
+  }
+  for (const m of milestones) {
+    m.depends_on = m.depends_on.map((dep) => {
+      const norm = dep.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+      return idByTitle.get(norm) ?? dep;
+    });
+  }
   const plan: ProjectPlan = { version: typeof raw.version === "number" ? raw.version : 1, goal: projectString(raw.goal), context: projectString(raw.context), constraints: projectStrings(raw.constraints), acceptance_criteria: projectStrings(raw.acceptance_criteria), validation: { required: projectStrings(projectValidation.required ?? raw.validation) }, milestones };
+  // Market-research block is optional (legacy plans omit it).
+  const researchRaw = raw.research && typeof raw.research === "object" ? raw.research as Record<string, unknown> : null;
+  if (researchRaw) {
+    const existing = Array.isArray(researchRaw.existing_solutions)
+      ? researchRaw.existing_solutions.map((e) => {
+          const o = e && typeof e === "object" ? e as Record<string, unknown> : {};
+          return { name: projectString(o.name), url: projectString(o.url), assessment: projectString(o.assessment) };
+        }).filter((e) => e.name)
+      : [];
+    const decision = researchRaw.decision === "reuse" || researchRaw.decision === "adapt" || researchRaw.decision === "build" || researchRaw.decision === "hybrid" ? researchRaw.decision : undefined;
+    if (projectString(researchRaw.summary) || existing.length || decision) {
+      plan.research = { summary: projectString(researchRaw.summary), existing_solutions: existing, decision: decision ?? "build", rationale: projectString(researchRaw.rationale) };
+    }
+  }
   const errors = validateProjectPlan(plan);
   if (errors.length) throw new Error(`Invalid project plan: ${errors.join("; ")}`);
   return plan;
@@ -1452,10 +1499,10 @@ export function milestoneToAcceptanceContract(plan: ProjectPlan, milestone: Mile
 }
 
 /** Read-only PM process arguments. Exported here to keep launch policy unit-testable. */
-export function productManagerPiArgs(model: string, writeGuardExtensionPath: string): string[] {
-  // PM may write only its response artifacts. The explicitly loaded guard
-  // enforces that boundary; no shell or edit tool is granted.
-  const args = ["--no-extensions", "--tools", "read,grep,find,ls,write", "--extension", writeGuardExtensionPath];
+export function productManagerPiArgs(model: string, writeGuardExtensionPath: string, searchExtensionPath: string): string[] {
+  // PM may write only its response artifacts (guarded) and research the web
+  // (read-only pm_search); no shell/edit tools are granted.
+  const args = ["--no-extensions", "--tools", "read,grep,find,ls,write,pm_search", "--extension", writeGuardExtensionPath, "--extension", searchExtensionPath];
   if (model && model !== "default") args.unshift("--model", model);
   return args;
 }
@@ -1472,7 +1519,40 @@ export function extractCorrelatedYamlBlock(text: string, requestId: string, expe
 }
 
 export function buildProductManagerPlanPrompt(input: { sourceRequest: string; repoPath: string; requestId: string; responsePath: string }): string {
-  return `You are the Product Manager for a Dual-Gate project. Produce a WBS only; never implement, edit, create, delete, or propose direct source edits. You may write exactly one response artifact at RESPONSE PATH; an enforced tool guard blocks every write outside the Product Manager artifact directory.\n\nREPOSITORY: ${input.repoPath}\nREQUEST: ${input.sourceRequest}\nRESPONSE PATH: ${input.responsePath}\n\nWrite exactly one YAML document to RESPONSE PATH, then reply briefly that it was written. The YAML MUST include protocol_version: 1, request_id: ${input.requestId}, kind: plan, followed by the complete Project Plan schema below. Every milestone must be dependency ordered and scoped. Use only simple one-line scalars and YAML lists: never use folded/literal block scalars (greater-than or pipe style), anchors, or multi-line values.\n\n\`\`\`yaml\nprotocol_version: 1\nrequest_id: <the request_id above>\nkind: plan\ngoal: ...\ncontext: ...\nconstraints: [...]\nacceptance_criteria: [...]\nvalidation: { required: [...] }\nmilestones: [...]\n\`\`\``;
+  return `You are the Product Manager for a Dual-Gate project. Produce a WBS only; never implement, edit, create, delete, or propose direct source edits. You may write exactly one response artifact at RESPONSE PATH; an enforced tool guard blocks every write outside the Product Manager artifact directory. You have a read-only pm_search web-search tool for market research.
+
+REPOSITORY: ${input.repoPath}
+REQUEST: ${input.sourceRequest}
+RESPONSE PATH: ${input.responsePath}
+
+## MANDATORY: market research first
+Before writing the plan, use pm_search (1-3 targeted queries) to check whether this has already been solved:
+1. Is there an existing open-source project/library that covers most of the request? (search GitHub/npm keywords)
+2. Are there prior comparable products or implementations we can learn from or adapt?
+3. What is the reuse-vs-build decision and why?
+Then incorporate a research block into your plan with: summary, existing_solutions (name/url/assessment), decision (reuse|adapt|build|hybrid), rationale. The WBS milestones must reflect the decision: prefer adapting existing work over building from zero when a mature option exists.
+
+Write exactly one YAML document to RESPONSE PATH, then reply briefly that it was written. The YAML MUST include protocol_version: 1, request_id: ${input.requestId}, kind: plan, followed by the complete Project Plan schema below, plus the research block. Every milestone must be dependency ordered and scoped. Use only simple one-line scalars and YAML lists: never use folded/literal block scalars (greater-than or pipe style), anchors, or multi-line values.
+
+\`\`\`yaml
+protocol_version: 1
+request_id: <the request_id above>
+kind: plan
+goal: ...
+context: ...
+constraints: [...]
+acceptance_criteria: [...]
+validation: { required: [...] }
+research:
+  summary: ...
+  existing_solutions:
+    - name: ...
+      url: ...
+      assessment: ...
+  decision: reuse|adapt|build|hybrid
+  rationale: ...
+milestones: [...]
+\`\`\``;
 }
 
 export function buildMilestoneCompletionFeedbackPrompt(input: ProjectMilestoneFeedback & { response_path: string }): string {
@@ -1524,7 +1604,10 @@ export function isProjectFinalizationStopped(status: ProjectState, stopRequested
 
 export function canAcceptProject(input: { orderedMilestoneIds: string[]; milestones: ProjectRecord["milestones"]; finalGatePassed: boolean; productAcceptance: ProjectAcceptance | null; acceptance: ProjectAcceptance | null }): boolean {
   const acceptedAndClear = (value: ProjectAcceptance | null) => !!value && value.verdict === "accepted" && !value.gaps.length && !value.unresolved.length;
-  return acceptedAndClear(input.productAcceptance) && acceptedAndClear(input.acceptance) && input.finalGatePassed && input.orderedMilestoneIds.every((id) => { const m = input.milestones[id]; return m?.status === "CONVERGED" && m.verdict === "converged" && !(m.unresolved?.length); });
+  // A milestone counts as accepted when it CONVERGED with a converged Judge
+  // verdict. Executor `unresolved` notes are retained for audit but do not
+  // independently block acceptance (the Judge already weighed them).
+  return acceptedAndClear(input.productAcceptance) && acceptedAndClear(input.acceptance) && input.finalGatePassed && input.orderedMilestoneIds.every((id) => { const m = input.milestones[id]; return m?.status === "CONVERGED" && m.verdict === "converged"; });
 }
 
 export function parseConvergenceDiagnosis(text: string): ConvergenceDiagnosis | null {

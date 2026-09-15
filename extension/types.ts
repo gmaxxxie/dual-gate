@@ -151,6 +151,13 @@ export interface ProjectPlan {
   acceptance_criteria: string[];
   validation: { required: string[] };
   milestones: Milestone[];
+  /** Market-research summary from the Product Manager (reuse-vs-build analysis). */
+  research?: {
+    summary: string;
+    existing_solutions: Array<{ name: string; url: string; assessment: string }>;
+    decision: "reuse" | "adapt" | "build" | "hybrid";
+    rationale: string;
+  };
 }
 
 export interface ProjectMilestoneContext {

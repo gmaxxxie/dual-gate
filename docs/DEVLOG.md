@@ -6,6 +6,20 @@
 
 ## 2026-09-15
 
+### 实测：市场调研先行（Product Manager 联网调研）
+
+给 PM pane 新增只读 `pm_search` 工具（`pm-search.ts`，走 Tavily/Exa，来自 `~/.pi/web-search.json`），规划 prompt 强制「先调研 → 复用/借鉴/自研决策 → 再写 WBS」。
+
+用 DeepSeek 全家实测 markdown 渲染项目：PM 调研到 markdown-it/marked/nano-markdown 三个方案（带下载量/评估），决策 `reuse` 选 markdown-it，里程碑全部围绕「复用」展开；实现用 markdown-it + `enableOnly` 限制规则集，25 测试全绿，6 里程碑收敛，项目 ACCEPTED。
+
+**本次配套修复**：
+1. `>`/`|` 折叠块支持 chomping（`>-`/`|-`/`>+`/`|+`）且 `>` 折叠为空格、`|` 保留换行（此前 `summary: >-` 被解析成空对象 → Judge 看到 `[object Object]`）。
+2. 里程碑无 id 时用 title 生成 slug id；`depends_on` 用名称引用时按 title slug 归一化解析。
+3. PM 退化输出（milestones 为纯字符串列表）时降级为单里程碑（scope=列表项），保留 research 决策。
+4. `ProjectPlan.research` 可选字段 + 解析 + 计划展示。
+5. Executor 报告读取改为轮询等待实质内容（最长 60s），解决大报告写入慢导致读空。
+6. 里程碑收敛以 Judge verdict 为准，Executor 的 unresolved 备注不再独立阻塞（避免误判 FAILED）。
+
 ### 实测：并行里程碑端到端（DeepSeek 全家）
 
 用 DeepSeek 同时作主控/Controller/Judge、PM、Executor，对三里程碑项目（M1/M2 无依赖、M3 依赖两者）完成真实并行验证：

@@ -355,6 +355,13 @@ test("parseTolerantYaml flow-style map/list with nested arrays", () => {
   assert.deepEqual(nested?.scope, { files: ["x"], components: ["y"] });
 });
 
+test("parseTolerantYaml handles folded/literal block scalars with chomping (|-, >-)", () => {
+  const parsed = parseTolerantYaml("summary: >-\n  line one\n  line two\nstatus: completed\nnotes: |-\n  kept\n  as-is");
+  assert.equal(parsed?.summary, "line one line two"); // folded → spaces
+  assert.equal(parsed?.notes, "kept\nas-is"); // literal → newlines preserved
+  assert.equal(parsed?.status, "completed");
+});
+
 // ---------------------------------------------------------------------------
 // 7. Judge output parsing
 // ---------------------------------------------------------------------------
@@ -760,6 +767,16 @@ test("project plan parses and orders stable WBS", () => {
   assert.deepEqual(validateProjectPlan(plan), []);
 });
 
+test("project plan parses optional market-research block", () => {
+  const plan = parseProjectPlan(`goal: Build X\nacceptance_criteria: [a]\nvalidation: { required: [npm test] }\nresearch:\n  summary: Mature OSS exists; we adapt it\n  existing_solutions:\n    - name: lib-y\n      url: https://github.com/x/y\n      assessment: covers 80%\n  decision: adapt\n  rationale: avoid reimplementing mature logic\nmilestones:\n  - id: M1\n    title: Adapt lib-y\n    depends_on: []\n    scope: [integrate lib-y]\n    deliverables: [lib-y integrated]\n    acceptance: [works]`);
+  assert.equal(plan.research?.decision, "adapt");
+  assert.equal(plan.research?.existing_solutions[0].name, "lib-y");
+  assert.equal(plan.research?.summary.includes("OSS"), true);
+  // legacy plan without research still parses
+  const legacy = parseProjectPlan(projectYaml);
+  assert.equal(legacy.research, undefined);
+});
+
 test("parallel milestone scheduler groups independent milestones into batches", () => {
   // M1 -> M2, M1 -> M3: M2 and M3 are independent and can run in parallel.
   const milestones: any[] = [
@@ -876,11 +893,12 @@ test("project prompts and optional milestone context preserve existing schemas",
 });
 
 test("PM protocol correlates the latest fenced response and uses a guarded artifact-only launch", () => {
-  assert.deepEqual(productManagerPiArgs("default", "/guard.ts"), ["--no-extensions", "--tools", "read,grep,find,ls,write", "--extension", "/guard.ts"]);
-  const args = productManagerPiArgs("provider/pm", "/guard.ts");
+  assert.deepEqual(productManagerPiArgs("default", "/guard.ts", "/search.ts"), ["--no-extensions", "--tools", "read,grep,find,ls,write,pm_search", "--extension", "/guard.ts", "--extension", "/search.ts"]);
+  const args = productManagerPiArgs("provider/pm", "/guard.ts", "/search.ts");
   assert.deepEqual(args.slice(0, 2), ["--model", "provider/pm"]);
-  assert.ok(args.includes("read,grep,find,ls,write"));
+  assert.ok(args.includes("read,grep,find,ls,write,pm_search"));
   assert.ok(args.includes("/guard.ts"));
+  assert.ok(args.includes("/search.ts"));
   assert.ok(!args.join(" ").match(/\b(bash|edit)\b/));
   const stale = "```yaml\nprotocol_version: 1\nrequest_id: pm-x-2\nkind: plan\ngoal: stale\n```\n```yaml\nprotocol_version: 1\nrequest_id: pm-x-2\nkind: plan\ngoal: current\n```";
   assert.ok(extractCorrelatedYamlBlock(stale, "pm-x-2")?.includes("current"));
@@ -933,7 +951,7 @@ test("project acceptance parser and guards reject incomplete, unresolved, or fai
   assert.ok(!canAcceptProject({ orderedMilestoneIds: ["M1"], milestones, finalGatePassed: true, productAcceptance: acceptedWithGaps, acceptance: accepted }));
   assert.ok(!canAcceptProject({ orderedMilestoneIds: ["M1"], milestones, finalGatePassed: true, productAcceptance: accepted, acceptance: acceptedWithGaps }));
   assert.ok(!canAcceptProject({ orderedMilestoneIds: ["M1"], milestones, finalGatePassed: true, productAcceptance: accepted, acceptance: acceptedWithUnresolved }));
-  milestones.M1.unresolved = ["x"]; assert.ok(!canAcceptProject({ orderedMilestoneIds: ["M1"], milestones, finalGatePassed: true, productAcceptance: accepted, acceptance: accepted }));
+  milestones.M1.unresolved = ["x"]; assert.ok(canAcceptProject({ orderedMilestoneIds: ["M1"], milestones, finalGatePassed: true, productAcceptance: accepted, acceptance: accepted })); // converged + judge converged → accepted even with unresolved notes
   milestones.M1.unresolved = []; assert.ok(!canAcceptProject({ orderedMilestoneIds: ["M1"], milestones, finalGatePassed: false, productAcceptance: accepted, acceptance: accepted }));
   assert.ok(buildProjectAcceptancePrompt({ plan: parseProjectPlan(projectYaml), milestones: [], diff: "", gateSummary: "PASS", productAcceptance: accepted! }).includes("never bypasses Controller"));
 });

@@ -145,6 +145,8 @@ cp -r extension ~/.pi/agent/extensions/dual-gate/
 
 `/dual project <request>` 是显式入口；普通输入仍走原有单任务闭环。项目开始前会创建持久、可见的 **PM** Herdr pane，与主 Controller/Judge pane 和当前里程碑 Executor pane 并存。PM 无 shell/编辑工具，仅有 `read,grep,find,ls` 及一个被路径守卫（`pm-write-guard.ts`）限制到其产物目录的 `write` 工具，因此绝不可能改动项目源码；WBS、里程碑反馈与产品验收都经由这些持久产物提交。主 Pi 校验、展示并让用户显式批准，且始终独占里程碑契约、任务规划/控制、Gate、Judge、持久化和取消权。
 
+生成 WBS 前，PM 先执行**市场调研先行**：用只读 `pm_search` 工具（Tavily/Exa）联网搜索已有的开源方案、先例实现与同类产品，并在计划中记录 `research` 块——`existing_solutions`（name/url/assessment）、`decision`（reuse|adapt|build|hybrid）与 `rationale`。里程碑必须体现该决策，优先改造成熟库而非从零自研；调研结论随计划展示并持久化到产物中。
+
 里程碑按**依赖有序批次**调度：同批内无依赖的里程碑并发执行，各自使用独立 git worktree + Executor pane，收敛后**自动合并**回主 checkout（先把 Executor 的改动提交到其分支，再 `git merge`）。测试文件的合并冲突按可累加原则自动解决；其他冲突会使该里程碑失败并保留 worktree 供人工处理。依赖的里程碑进入后续批次，因此每个里程碑只在其全部依赖合并后才启动。
 
 每个里程碑仍复用 Executor → Gate → Judge 闭环；其任务收敛并持久化后，主 Pi 向同一个 PM 发送有界、持久化的完成交接。PM 返回 `blocked` 会停止项目；PM 响应畸形、超时或会话丢失会 fail closed。全部里程碑后，主 Pi 先跑最终 Gate，再取得强制的 PM 产品验收，最后进行 Controller 独立 ratification。只有 PM 与 Controller 都 `accepted` 且无 gaps/unresolved、最终 Gate 通过、所有里程碑无 unresolved 地收敛，项目才会 `ACCEPTED`。默认保留 PM pane 供检查；`panel.on_complete: close` 或 `/dual cleanup` 才关闭。

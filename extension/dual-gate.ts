@@ -401,6 +401,7 @@ function stableHerdrPaneCwd(): string {
 }
 
 const PM_WRITE_GUARD_EXTENSION_PATH = join(dirname(fileURLToPath(import.meta.url)), "pm-write-guard.ts");
+const PM_SEARCH_EXTENSION_PATH = join(dirname(fileURLToPath(import.meta.url)), "pm-search.ts");
 
 async function herdrPaneSplit(opts: { direction: "right" | "down"; cwd: string; noFocus: boolean; ratio?: number; env?: Record<string, string> }): Promise<string> {
   const args = ["pane", "split", "--current", "--direction", opts.direction, "--cwd", opts.cwd];
@@ -435,7 +436,7 @@ function deriveProductManagerTitle(projectId: string, repoPath: string): string 
 
 /** PM deliberately gets only read-only Pi tools; all artifact writes stay in Main Pi. */
 function productManagerPiArgs(model: string): string[] {
-  return buildProductManagerPiArgs(model, PM_WRITE_GUARD_EXTENSION_PATH);
+  return buildProductManagerPiArgs(model, PM_WRITE_GUARD_EXTENSION_PATH, PM_SEARCH_EXTENSION_PATH);
 }
 
 function executorPiArgs(model: string): string[] {
@@ -1168,15 +1169,21 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, optio
 
       // ---- Read the execution report ----
       // The agent reports idle as soon as the turn settles, but Pi's
-      // alternate-screen output may still be flushing to the durable file /
-      // scrollback. Give it a moment, then retry reading once if empty.
-      await sleep(4000);
-      let finalText = await herdrAgentRead({ target: task.herdrAgentName!, lines: 400 });
-      if (taskStopped(task)) return;
+      // alternate-screen output and the durable file may still be flushing.
+      // Poll for a substantive report (file content or transcript) before
+      // judging; a large report can take a while to write.
+      let finalText = "";
       let durableReport = store.read("executor-report.yaml");
-      if ((!durableReport || !durableReport.trim()) && !finalText.trim()) {
+      for (let attempt = 0; attempt < 12; attempt++) {
+        if (durableReport && durableReport.trim() && durableReport.trim() !== "{}" && !/^\{\s*"status":\s*"failed"/.test(durableReport.trim())) break;
+        if (!finalText.trim()) {
+          finalText = await herdrAgentRead({ target: task.herdrAgentName!, lines: 400 });
+          if (taskStopped(task)) return;
+        }
+        const extracted = extractReportFromAgentMessage(finalText);
+        if ((extracted.status === "completed" || extracted.summary) && finalText.trim()) break;
+        if (durableReport && durableReport.trim() && !/^\{\s*"status":\s*"failed"/.test(durableReport.trim())) break;
         await sleep(5000);
-        finalText = await herdrAgentRead({ target: task.herdrAgentName!, lines: 400 });
         if (taskStopped(task)) return;
         durableReport = store.read("executor-report.yaml");
       }
@@ -2234,11 +2241,21 @@ function writeProjectState(project: ProjectRecord): void {
 
 function projectPlanDisplay(plan: ProjectPlan, projectId: string): string {
   const list = (items: string[]) => items.length ? items.map((x) => `  • ${x}`).join("\n") : "  • (none)";
+  const research = plan.research
+    ? [
+        "**Market research (reuse-vs-build)**",
+        `  • Decision: ${plan.research.decision}`,
+        plan.research.summary ? `  • ${plan.research.summary}` : "",
+        ...plan.research.existing_solutions.map((s) => `  • ${s.name} — ${s.url} — ${s.assessment}`),
+        plan.research.rationale ? `  • Why: ${plan.research.rationale}` : "",
+      ].join("\n")
+    : null;
   return [
     `## Dual-Gate Project Plan · ${projectId}`,
     `**Goal**\n${plan.goal}`,
     `**Constraints**\n${list(plan.constraints)}`,
-    "**Milestones (serial dependency order)**",
+    research ?? "",
+    "**Milestones (dependency-ordered batches; independent ones run in parallel worktrees)**",
     ...topologicallyOrderMilestones(plan.milestones).flatMap((m, i) => [
       `${i + 1}. **${m.id}: ${m.title}** (depends on: ${m.depends_on.join(", ") || "none"})`,
       `   Scope: ${[...m.scope.files, ...m.scope.components].join(", ")}`,
@@ -2251,7 +2268,7 @@ function projectPlanDisplay(plan: ProjectPlan, projectId: string): string {
     list(plan.acceptance_criteria),
     "**Final validation**",
     list(plan.validation.required),
-  ].join("\n\n");
+  ].filter((x) => x !== "").join("\n\n");
 }
 
 function readPersistedProject(cwd: string, projectId: string): ProjectRecord | null {
@@ -2371,7 +2388,10 @@ async function runProject(ctx: ExtensionCommandContext, request: string, repoOve
         const taskStore = makeStore(task);
         const report = extractReportFromAgentMessage(taskStore.read("executor-report.yaml") ?? "");
         const judge = parseJudgeOutput(taskStore.read("judge.yaml") ?? "");
-        record.status = task.state === "DONE" && judge?.verdict === "converged" && !(report.unresolved as unknown[] ?? []).length ? "CONVERGED" : task.state === "CANCELLED" ? "CANCELLED" : task.state === "ESCALATED" ? "BLOCKED" : "FAILED";
+        // Convergence is decided by the Judge (which saw gate pass + expected vs
+        // actual). Executor `unresolved` notes are retained as records but do not
+        // independently block a milestone that the Judge already converged.
+        record.status = task.state === "DONE" && judge?.verdict === "converged" ? "CONVERGED" : task.state === "CANCELLED" ? "CANCELLED" : task.state === "ESCALATED" ? "BLOCKED" : "FAILED";
         record.summary = typeof report.summary === "string" ? report.summary : ""; record.verdict = judge?.verdict; record.unresolved = Array.isArray(report.unresolved) ? report.unresolved.map(String) : []; record.deviations = Array.isArray(report.deviations) ? report.deviations.map(String) : []; record.completedAt = new Date().toISOString();
         milestoneStore.write("task-ref.json", { taskId: task.taskId, taskArtifactDir: task.artifactDir, taskState: task.state, judgeVerdict: judge?.verdict, worktreePath, parallel, completedAt: record.completedAt });
         milestoneStore.write("state.json", record);
