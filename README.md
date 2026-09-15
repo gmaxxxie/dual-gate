@@ -99,7 +99,7 @@ Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual product-m
 |---|---|
 | `/dual on` / `/dual off` | Enable/disable. OFF fully restores normal Pi |
 | `/dual status` | Status: models, Herdr, Task, State, Iteration, Spec version, Pane, Session alive, and active project progress |
-| `/dual project <request>` | Create a project WBS, show it for explicit approval, then execute dependency-ordered milestones serially |
+| `/dual project <request>` | Create a project WBS, show it for explicit approval, then execute milestone batches (independent milestones run in parallel worktrees, auto-merged) |
 | `/dual project status` | Show active project milestone/final-acceptance progress |
 | `/dual models` | View current model config |
 | `/dual controller [id]` | Choose Controller/Judge model (no arg opens a selector) |
@@ -144,6 +144,8 @@ Do not use project mode for trivial edits, independent chores, or work that cann
 ## Project mode (three panes)
 
 `/dual project <request>` is explicit: ordinary prompts remain unchanged. Project mode creates a persistent visible **PM** Herdr pane before WBS generation, alongside the main Controller/Judge pane and the current milestone Executor pane. The PM has no shell/edit tools and only `read,grep,find,ls` plus a `write` tool guarded to its artifact directory (enforced by `pm-write-guard.ts`); it can never touch project source. It produces its WBS, milestone feedback, and product acceptance through those durable project artifacts. Main Pi validates and presents that WBS for explicit user approval, then remains sole owner of milestone contracts, task planning/control, Gate, Judge, persistence, and cancellation.
+
+Milestones are scheduled into **dependency-ordered batches**: independent milestones in the same batch run concurrently, each in its own isolated git worktree + Executor pane, and are **auto-merged** back to the main checkout on convergence (committing the executor's work to its branch, then `git merge`). Test-file merge conflicts are auto-resolved additively; other conflicts fail the milestone with the worktree kept for manual resolution. Dependent milestones run in later batches, so a milestone only starts after all of its dependencies are merged.
 
 Each milestone still uses the unchanged Executor → Gate → Judge loop. Once its persisted task has converged, Main sends the same PM a bounded durable completion handoff. A PM `blocked` handoff stops the project; malformed, timeout, or lost-PM failures fail closed. After all milestones, Main runs the final Gate, obtains mandatory PM product acceptance, then independently asks the Controller for ratification. `ACCEPTED` requires clear PM acceptance, clear Controller ratification, a final Gate pass, and every milestone converged with no unresolved items. PM panes remain for inspection unless `panel.on_complete` is `close` or `/dual cleanup` is run.
 

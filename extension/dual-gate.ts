@@ -48,6 +48,8 @@ import {
   productManagerPiArgs as buildProductManagerPiArgs,
   parseProjectPlan,
   topologicallyOrderMilestones,
+  scheduleMilestoneBatches,
+  isParallelBatch,
   milestoneToAcceptanceContract,
   buildProjectAcceptancePrompt,
   parseProjectAcceptance,
@@ -772,6 +774,92 @@ async function createWorktree(repoPath: string, taskId: string): Promise<string>
   return wt;
 }
 
+/** Remove an isolated worktree (and its branch) after parallel execution. */
+async function removeWorktree(repoPath: string, worktreePath: string, taskId: string): Promise<void> {
+  await exec("git", ["worktree", "remove", "--force", worktreePath], { cwd: repoPath, timeoutMs: 30_000 }).catch(() => {});
+  const branch = `dg-${taskId}`;
+  await exec("git", ["branch", "-D", branch], { cwd: repoPath, timeoutMs: 15_000 }).catch(() => {});
+}
+
+/**
+ * Commit the executor's changes inside an isolated worktree so they can be
+ * merged back. The executor deliberately does not commit, so we do it here
+ * on its branch before merging into the main checkout.
+ */
+async function commitWorktree(repoPath: string, worktreePath: string, taskId: string): Promise<{ ok: boolean; message?: string }> {
+  const branch = `dg-${taskId}`;
+  const configOk = await exec("git", ["config", "user.email", "dual-gate@local"], { cwd: worktreePath, timeoutMs: 15_000 }).catch(() => ({ code: 1 } as const));
+  await exec("git", ["config", "user.name", "Dual-Gate"], { cwd: worktreePath, timeoutMs: 15_000 }).catch(() => {});
+  const add = await exec("git", ["add", "-A"], { cwd: worktreePath, timeoutMs: 30_000 });
+  if (add.code !== 0) return { ok: false, message: add.stderr };
+  const status = await exec("git", ["status", "--porcelain"], { cwd: worktreePath, timeoutMs: 15_000 });
+  if (status.code === 0 && !status.stdout.trim()) {
+    return { ok: true, message: "no changes" }; // nothing to commit
+  }
+  const commit = await exec("git", ["commit", "-m", `dual-gate: ${taskId}`], { cwd: worktreePath, timeoutMs: 30_000 });
+  if (commit.code !== 0) return { ok: false, message: commit.stderr || commit.stdout };
+  return { ok: true, message: commit.stdout.slice(0, 300) };
+}
+
+/**
+ * Resolve a merge conflict in a test file by concatenating both sides (minus
+ * conflict markers), deduplicating imports. Test files are additive: both
+ * parallel milestones' tests belong in the final tree. Returns true when the
+ * conflict was resolved and staged.
+ */
+async function resolveTestFileConflict(repoPath: string, worktreePath: string, file: string): Promise<boolean> {
+  void repoPath;
+  const abs = join(worktreePath, file);
+  let raw: string;
+  try { raw = readFileSync(abs, "utf8"); } catch { return false; }
+  if (!raw.includes("<<<<<<<")) return false;
+  const segments = raw.split(/^<{7} [^\n]*\n/m);
+  const blocks: string[] = [];
+  for (const seg of segments) {
+    const oursEnd = seg.indexOf("=======\n");
+    const theirsStart = seg.indexOf(">>>>>>>");
+    if (oursEnd !== -1 && theirsStart !== -1) {
+      const ours = seg.slice(0, oursEnd);
+      const theirs = seg.slice(oursEnd + 8, theirsStart).replace(/^>+[^\n]*$/m, "");
+      blocks.push(ours, theirs);
+    } else {
+      blocks.push(seg);
+    }
+  }
+  const merged = blocks.join("");
+  // Deduplicate import lines (keep first occurrence).
+  const seen = new Set<string>();
+  const out = merged.split(/\r?\n/).map((line) => {
+    if (/^import .* from ".+";?$/.test(line.trim())) {
+      const key = line.trim();
+      if (seen.has(key)) return "";
+      seen.add(key);
+    }
+    return line;
+  }).filter((l, i, arr) => !(l === "" && (i === 0 || arr[i - 1] === ""))).join("\n");
+  writeFileSync(abs, out, "utf8");
+  const add = await exec("git", ["add", file], { cwd: worktreePath, timeoutMs: 15_000 });
+  return add.code === 0;
+}
+
+/**
+ * Merge a completed parallel worktree branch back into the main checkout.
+ * Returns the merge outcome; on conflict the worktree is left in place for
+ * inspection and the milestone is marked MERGE_CONFLICT.
+ */
+async function mergeWorktreeBack(repoPath: string, worktreePath: string, taskId: string): Promise<{ outcome: "merged" | "conflict" | "skipped"; message?: string }> {
+  const branch = `dg-${taskId}`;
+  const { code, stdout, stderr } = await exec("git", ["merge", branch, "--no-edit", "--no-ff"], { cwd: repoPath, timeoutMs: 60_000 });
+  if (code === 0) return { outcome: "merged", message: stdout.slice(0, 500) };
+  return { outcome: "conflict", message: (stderr || stdout).slice(0, 500) };
+}
+
+/** Resolve whether a milestone ran in an isolated worktree for this batch. */
+async function gitIsClean(repoPath: string): Promise<boolean> {
+  const { code, stdout } = await exec("git", ["status", "--porcelain"], { cwd: repoPath, timeoutMs: 15_000 });
+  return code === 0 && stdout.trim().length === 0;
+}
+
 // ---------------------------------------------------------------------------
 // LLM roles
 // ---------------------------------------------------------------------------
@@ -870,12 +958,17 @@ function presentPlanningSummary(task: TaskRecord, contract: AcceptanceContract, 
 // The closed-loop orchestration
 // ---------------------------------------------------------------------------
 
-async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, options: { initialContract?: AcceptanceContract; projectContext?: ProjectMilestoneContext } = {}): Promise<void> {
+async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, options: { initialContract?: AcceptanceContract; projectContext?: ProjectMilestoneContext; suppressGlobalFlags?: boolean } = {}): Promise<void> {
   const rt = getRuntime();
   const config = rt.config;
   const store = makeStore(task);
-  rt.running = true;
-  rt.stopRequested = false;
+  const suppress = options.suppressGlobalFlags === true;
+  // Project batch runs hold rt.running themselves; individual milestone loops
+  // must not clobber it (parallel members would reset each other's flag).
+  if (!suppress) {
+    rt.running = true;
+    rt.stopRequested = false;
+  }
 
   try {
     // ---- Phase 0: Plan (Expected V1) ----
@@ -924,7 +1017,11 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, optio
     const mode = config.worktree.mode;
     let worktreePath: string | null = null;
     const concurrentWriters = rt.manager.all().filter((t) => t.taskId !== task.taskId && ["EXECUTING", "GATING", "JUDGING", "FIXING_IMPLEMENTATION", "REVISING_SPEC"].includes(t.state)).length;
-    if (mode === "isolated" || (mode === "auto" && concurrentWriters > 0)) {
+    // A project batch may have pre-created an isolated worktree (parallel
+    // milestones); reuse it instead of creating a second one.
+    if (task.worktreePath && existsSync(task.worktreePath)) {
+      worktreePath = task.worktreePath;
+    } else if (mode === "isolated" || (mode === "auto" && concurrentWriters > 0)) {
       worktreePath = await createWorktree(repoPath, task.taskId);
       if (taskStopped(task)) return;
       rt.manager.patch(task.taskId, { worktreePath });
@@ -1070,12 +1167,22 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, optio
       if (requirementRevised) continue;
 
       // ---- Read the execution report ----
-      const finalText = await herdrAgentRead({ target: task.herdrAgentName!, lines: 400 });
+      // The agent reports idle as soon as the turn settles, but Pi's
+      // alternate-screen output may still be flushing to the durable file /
+      // scrollback. Give it a moment, then retry reading once if empty.
+      await sleep(4000);
+      let finalText = await herdrAgentRead({ target: task.herdrAgentName!, lines: 400 });
       if (taskStopped(task)) return;
+      let durableReport = store.read("executor-report.yaml");
+      if ((!durableReport || !durableReport.trim()) && !finalText.trim()) {
+        await sleep(5000);
+        finalText = await herdrAgentRead({ target: task.herdrAgentName!, lines: 400 });
+        if (taskStopped(task)) return;
+        durableReport = store.read("executor-report.yaml");
+      }
       // Pi's alternate-screen scrollback may retain only the tail of a report.
       // Prefer the executor's durable report when it was written, then fall
       // back to the terminal transcript for older workers.
-      const durableReport = store.read("executor-report.yaml");
       report = extractReportFromAgentMessage(durableReport || finalText);
       if (config.context.send_full_executor_history_to_judge) {
         report = { ...report, executor_history: finalText };
@@ -1122,6 +1229,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, optio
         }
         await waitForExecutorCompletion(task, config, { shouldStop: () => taskStopped(task) });
         if (taskStopped(task)) return;
+        await sleep(4000);
         const fixText = await herdrAgentRead({ target: task.herdrAgentName!, lines: 400 });
         if (taskStopped(task)) return;
         report = extractReportFromAgentMessage(fixText);
@@ -1402,9 +1510,11 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, optio
       ctx.ui.notify(`Dual-Gate: error — ${errMsg(e)}`, "error");
     }
   } finally {
-    rt.running = false;
-    updateWidget(ctx);
-    setStatus(ctx, undefined);
+    if (!suppress) {
+      rt.running = false;
+      updateWidget(ctx);
+      setStatus(ctx, undefined);
+    }
   }
 }
 
@@ -2166,9 +2276,13 @@ function presentProjectStatus(project: ProjectRecord): void {
   showText(lines.join("\n"));
 }
 
-async function runProject(ctx: ExtensionCommandContext, request: string): Promise<void> {
+async function runProject(ctx: ExtensionCommandContext, request: string, repoOverride?: string): Promise<void> {
   const rt = getRuntime();
   const config = rt.config;
+  // A repoOverride (from `/dual project repo=<path> <request>`) lets the
+  // controller run projects against a Git checkout even when its pane cwd is
+  // a non-repository directory (Herdr reaps panes split into a Git worktree).
+  const repoPath = normalizeRepoPath(repoOverride ?? ctx.cwd);
   if (config.worktree.mode === "isolated") {
     ctx.ui.notify("Dual-Gate project mode requires worktree.mode auto or current; isolated milestones cannot share changes.", "error");
     return;
@@ -2184,10 +2298,10 @@ async function runProject(ctx: ExtensionCommandContext, request: string): Promis
   rt.running = true;
   rt.stopRequested = false;
   const projectId = generateProjectId();
-  const artifactDir = projectDirFor(ctx.cwd, projectId);
+  const artifactDir = projectDirFor(repoPath, projectId);
   const store = createArtifactStore(artifactDir);
   const now = new Date().toISOString();
-  let project: ProjectRecord = { projectId, sourceRequest: request, repoPath: normalizeRepoPath(ctx.cwd), artifactDir, status: "PLANNING", orderedMilestoneIds: [], milestones: {}, productManager: { model: config.product_manager.model, state: "STARTING", recoveryCount: 0 }, createdAt: now, updatedAt: now };
+  let project: ProjectRecord = { projectId, sourceRequest: request, repoPath, artifactDir, status: "PLANNING", orderedMilestoneIds: [], milestones: {}, productManager: { model: config.product_manager.model, state: "STARTING", recoveryCount: 0 }, createdAt: now, updatedAt: now };
   rt.activeProject = project;
   writeProjectState(project);
   try {
@@ -2208,7 +2322,7 @@ async function runProject(ctx: ExtensionCommandContext, request: string): Promis
     store.write("project-plan.yaml", JSON.stringify(plan, null, 2));
     project.status = "AWAITING_APPROVAL"; project.updatedAt = new Date().toISOString(); writeProjectState(project);
     showText(projectPlanDisplay(plan, projectId));
-    const approved = await ctx.ui.confirm("Approve project plan", `Execute ${ordered.length} serial milestones for: ${plan.goal}?`);
+    const approved = await ctx.ui.confirm("Approve project plan", `Execute ${ordered.length} milestones in dependency-ordered batches${scheduleMilestoneBatches(ordered).some((b) => b.length > 1) ? " (independent milestones run in parallel worktrees)" : ""} for: ${plan.goal}?`);
     store.write("project-approval.json", { approved, at: new Date().toISOString() });
     if (!approved || project.status === "CANCELLED" || rt.stopRequested) {
       project.status = "CANCELLED"; project.updatedAt = new Date().toISOString();
@@ -2221,42 +2335,124 @@ async function runProject(ctx: ExtensionCommandContext, request: string): Promis
     }
     project.status = "RUNNING"; project.updatedAt = new Date().toISOString(); writeProjectState(project);
     const completed: ProjectMilestoneContext["completedSummaries"] = [];
-    for (const milestone of ordered) {
-      const record = project.milestones[milestone.id];
-      if (!milestone.depends_on.every((id) => project.milestones[id]?.status === "CONVERGED")) { record.status = "BLOCKED"; project.status = "BLOCKED"; break; }
-      project.currentMilestoneId = milestone.id; record.status = "RUNNING"; project.updatedAt = new Date().toISOString(); writeProjectState(project);
-      const milestoneStore = createArtifactStore(projectMilestoneDirFor(ctx.cwd, projectId, milestone.id));
-      milestoneStore.write("milestone.yaml", JSON.stringify(milestone, null, 2));
-      milestoneStore.write("state.json", record);
-      let contract = milestoneToAcceptanceContract(plan, milestone, request);
-      const riskText = [request, milestone.title, ...milestone.expected_outcome, ...milestone.acceptance_criteria, ...milestone.risk.concerns].join("\n");
-      contract = higherRisk(contract, detectRisk(riskText));
-      const task = rt.manager.begin(request, { controller: resolveModelString(config.controller.model) ?? controller, executor: resolveModelString(config.executor.model) ?? { provider: "", id: config.executor.model, name: config.executor.model } }, detectRisk(riskText).level);
-      record.taskId = task.taskId; record.taskArtifactDir = task.artifactDir;
-      const context: ProjectMilestoneContext = { projectId, projectGoal: plan.goal, milestoneId: milestone.id, milestoneTitle: milestone.title, scope: milestone.scope, dependsOn: milestone.depends_on, completedSummaries: completed };
-      await orchestrate(ctx, task, { initialContract: contract, projectContext: context });
-      rt.running = true; // the task runner clears its own flag; the project still owns input
-      const taskStore = makeStore(task);
-      const report = extractReportFromAgentMessage(taskStore.read("executor-report.yaml") ?? "");
-      const judge = parseJudgeOutput(taskStore.read("judge.yaml") ?? "");
-      record.status = task.state === "DONE" && judge?.verdict === "converged" && !(report.unresolved as unknown[] ?? []).length ? "CONVERGED" : task.state === "CANCELLED" ? "CANCELLED" : task.state === "ESCALATED" ? "BLOCKED" : "FAILED";
-      record.summary = typeof report.summary === "string" ? report.summary : ""; record.verdict = judge?.verdict; record.unresolved = Array.isArray(report.unresolved) ? report.unresolved.map(String) : []; record.deviations = Array.isArray(report.deviations) ? report.deviations.map(String) : []; record.completedAt = new Date().toISOString();
-      milestoneStore.write("task-ref.json", { taskId: task.taskId, taskArtifactDir: task.artifactDir, taskState: task.state, judgeVerdict: judge?.verdict, completedAt: record.completedAt });
-      milestoneStore.write("state.json", record);
-      project.updatedAt = new Date().toISOString(); writeProjectState(project);
-      if (record.status !== "CONVERGED") { project.status = record.status === "BLOCKED" ? "BLOCKED" : record.status === "CANCELLED" ? "CANCELLED" : "FAILED"; break; }
-      // The PM sees a bounded, persisted handoff only after task DONE/Judge convergence.
-      const feedbackBase: ProjectMilestoneFeedback = {
-        protocol_version: 1, request_id: "", kind: "milestone_feedback", milestone_id: milestone.id, task_id: task.taskId,
-        executor_summary: (record.summary ?? "").slice(0, 8000), judge: { verdict: judge?.verdict ?? "blocked", gaps: (judge?.gaps ?? []).slice(0, 20).map((gap) => gap.slice(0, 1000)) },
-        gate_summary: (taskStore.read("gate.log") ?? "").slice(0, 12000), unresolved: (record.unresolved ?? []).slice(0, 20).map((item) => item.slice(0, 1000)), deviations: (record.deviations ?? []).slice(0, 20).map((item) => item.slice(0, 1000)),
-        artifact_refs: { taskArtifactDir: task.artifactDir, milestoneArtifactDir: milestoneStore.dir() },
-      };
-      const pmFeedback = await requestProductManager(ctx, project, config, "milestone_feedback", feedbackBase as unknown as Record<string, unknown>, (requestId, responsePath) => buildMilestoneCompletionFeedbackPrompt({ ...feedbackBase, request_id: requestId, response_path: responsePath }), parseProductMilestoneFeedback);
-      const persistedFeedback = { ...feedbackBase, ...pmFeedback, request_id: project.productManager?.lastRequestId ?? "" };
-      productManagerStore(project).write(`milestone-${milestone.id}-feedback.yaml`, persistedFeedback);
-      if (pmFeedback.decision === "blocked") { project.status = "BLOCKED"; project.error = pmFeedback.reason; project.updatedAt = new Date().toISOString(); writeProjectState(project); break; }
-      completed.push({ milestoneId: milestone.id, title: milestone.title, summary: record.summary ?? "", verdict: "converged" });
+    const batches = scheduleMilestoneBatches(ordered);
+    for (const batch of batches) {
+      if (project.status !== "RUNNING") break;
+      const parallel = isParallelBatch(batch);
+      ctx.ui.notify(`Dual-Gate: executing milestone batch ${batches.indexOf(batch) + 1}/${batches.length}${parallel ? ` (${batch.length} parallel)` : ""}…`, "info");
+
+      // Run every milestone in this batch, concurrently when the batch is
+      // parallel (each in its own worktree), serially otherwise.
+      const results = await Promise.all(batch.map(async (milestone) => {
+        const record = project.milestones[milestone.id];
+        const milestoneStore = createArtifactStore(projectMilestoneDirFor(repoPath, projectId, milestone.id));
+        project.currentMilestoneId = milestone.id; record.status = "RUNNING"; project.updatedAt = new Date().toISOString(); writeProjectState(project);
+        milestoneStore.write("milestone.yaml", JSON.stringify(milestone, null, 2));
+        milestoneStore.write("state.json", record);
+
+        let contract = milestoneToAcceptanceContract(plan, milestone, request);
+        const riskText = [request, milestone.title, ...milestone.expected_outcome, ...milestone.acceptance_criteria, ...milestone.risk.concerns].join("\n");
+        contract = higherRisk(contract, detectRisk(riskText));
+        const task = rt.manager.beginFor(repoPath, request, { controller: resolveModelString(config.controller.model) ?? controller, executor: resolveModelString(config.executor.model) ?? { provider: "", id: config.executor.model, name: config.executor.model } }, detectRisk(riskText).level);
+        record.taskId = task.taskId; record.taskArtifactDir = task.artifactDir; record.parallel = parallel;
+
+        // Parallel milestones need an isolated worktree so their changes do not
+        // collide on the main checkout; the worktree is merged back afterwards.
+        let worktreePath: string | null = null;
+        if (parallel) {
+          worktreePath = await createWorktree(project.repoPath, task.taskId);
+          rt.manager.patch(task.taskId, { worktreePath });
+          record.worktreePath = worktreePath;
+        }
+
+        const context: ProjectMilestoneContext = { projectId, projectGoal: plan.goal, milestoneId: milestone.id, milestoneTitle: milestone.title, scope: milestone.scope, dependsOn: milestone.depends_on, completedSummaries: [...completed] };
+        await orchestrate(ctx, task, { initialContract: contract, projectContext: context, suppressGlobalFlags: true });
+        rt.running = true; // the task runner clears its own flag; the project still owns input
+        const taskStore = makeStore(task);
+        const report = extractReportFromAgentMessage(taskStore.read("executor-report.yaml") ?? "");
+        const judge = parseJudgeOutput(taskStore.read("judge.yaml") ?? "");
+        record.status = task.state === "DONE" && judge?.verdict === "converged" && !(report.unresolved as unknown[] ?? []).length ? "CONVERGED" : task.state === "CANCELLED" ? "CANCELLED" : task.state === "ESCALATED" ? "BLOCKED" : "FAILED";
+        record.summary = typeof report.summary === "string" ? report.summary : ""; record.verdict = judge?.verdict; record.unresolved = Array.isArray(report.unresolved) ? report.unresolved.map(String) : []; record.deviations = Array.isArray(report.deviations) ? report.deviations.map(String) : []; record.completedAt = new Date().toISOString();
+        milestoneStore.write("task-ref.json", { taskId: task.taskId, taskArtifactDir: task.artifactDir, taskState: task.state, judgeVerdict: judge?.verdict, worktreePath, parallel, completedAt: record.completedAt });
+        milestoneStore.write("state.json", record);
+        project.updatedAt = new Date().toISOString(); writeProjectState(project);
+
+        // Merge the isolated worktree back into the main checkout.
+        let mergeOutcome: "merged" | "conflict" | "skipped" | undefined;
+        if (parallel && worktreePath && record.status === "CONVERGED") {
+          const committed = await commitWorktree(project.repoPath, worktreePath, task.taskId);
+          if (!committed.ok) {
+            record.status = "FAILED"; record.merge = { outcome: "conflict", message: `worktree commit failed: ${committed.message}` , at: new Date().toISOString() };
+          } else {
+            let merged = await mergeWorktreeBack(project.repoPath, worktreePath, task.taskId);
+            if (merged.outcome === "conflict") {
+              // Test-file conflicts are additive: try to auto-resolve them so
+              // independent milestones can both land their tests.
+              const conflicts = (merged.message ?? "").match(/CONFLICT \(content\): Merge conflict in ([^\n]+)/g) ?? [];
+              let resolvedAll = true;
+              for (const m of conflicts) {
+                const file = m.replace(/^CONFLICT \(content\): Merge conflict in /, "").trim();
+                if (!/^(tests|test|__tests__)[\/]/.test(file)) { resolvedAll = false; break; }
+                const ok = await resolveTestFileConflict(project.repoPath, project.repoPath, file);
+                if (!ok) { resolvedAll = false; break; }
+              }
+              if (resolvedAll && conflicts.length > 0) {
+                const commit = await exec("git", ["commit", "--no-edit"], { cwd: project.repoPath, timeoutMs: 30_000 });
+                if (commit.code === 0) {
+                  merged = { outcome: "merged", message: "auto-resolved test-file conflicts" };
+                }
+              }
+            }
+            mergeOutcome = merged.outcome;
+            record.merge = { outcome: merged.outcome, message: merged.message, at: new Date().toISOString() };
+            if (merged.outcome === "conflict") {
+              record.status = "MERGE_CONFLICT";
+              ctx.ui.notify(`Dual-Gate: milestone ${milestone.id} merge conflict — worktree kept for inspection`, "warning");
+            } else {
+              await removeWorktree(project.repoPath, worktreePath, task.taskId).catch(() => {});
+            }
+          }
+        } else if (parallel && worktreePath) {
+          // milestone failed before merge; clean up the worktree
+          await removeWorktree(project.repoPath, worktreePath, task.taskId).catch(() => {});
+        }
+        project.updatedAt = new Date().toISOString(); writeProjectState(project);
+        return { milestone, record, mergeOutcome };
+      }));
+
+      // Batch finished: feed converged milestones to the PM in dependency order.
+      const settled = results.sort((a, b) => ordered.findIndex((m) => m.id === a.milestone.id) - ordered.findIndex((m) => m.id === b.milestone.id));
+      for (const { milestone, record } of settled) {
+        if (record.status === "CONVERGED") {
+          const taskStore = makeStore(rt.manager.get(record.taskId!)!);
+          const judge = parseJudgeOutput(taskStore.read("judge.yaml") ?? "");
+          const feedbackBase: ProjectMilestoneFeedback = {
+            protocol_version: 1, request_id: "", kind: "milestone_feedback", milestone_id: milestone.id, task_id: record.taskId!,
+            executor_summary: (record.summary ?? "").slice(0, 8000), judge: { verdict: judge?.verdict ?? "converged", gaps: (judge?.gaps ?? []).slice(0, 20).map((gap) => gap.slice(0, 1000)) },
+            gate_summary: (taskStore.read("gate.log") ?? "").slice(0, 12000), unresolved: (record.unresolved ?? []).slice(0, 20).map((item) => item.slice(0, 1000)), deviations: (record.deviations ?? []).slice(0, 20).map((item) => item.slice(0, 1000)),
+            artifact_refs: { taskArtifactDir: record.taskArtifactDir!, milestoneArtifactDir: createArtifactStore(projectMilestoneDirFor(repoPath, projectId, milestone.id)).dir() },
+          };
+          const pmFeedback = await requestProductManager(ctx, project, config, "milestone_feedback", feedbackBase as unknown as Record<string, unknown>, (requestId, responsePath) => buildMilestoneCompletionFeedbackPrompt({ ...feedbackBase, request_id: requestId, response_path: responsePath }), parseProductMilestoneFeedback);
+          const persistedFeedback = { ...feedbackBase, ...pmFeedback, request_id: project.productManager?.lastRequestId ?? "" };
+          productManagerStore(project).write(`milestone-${milestone.id}-feedback.yaml`, persistedFeedback);
+          if (pmFeedback.decision === "blocked") { project.status = "BLOCKED"; project.error = pmFeedback.reason; project.updatedAt = new Date().toISOString(); writeProjectState(project); break; }
+          completed.push({ milestoneId: milestone.id, title: milestone.title, summary: record.summary ?? "", verdict: "converged" });
+        }
+      }
+
+      // A non-converged milestone blocks the project unless it was a merge
+      // conflict (which only stops later batches, this batch already ran).
+      const failed = settled.find(({ record }) => record.status !== "CONVERGED");
+      if (failed) {
+        const { milestone, record } = failed;
+        if (record.status === "MERGE_CONFLICT") {
+          project.status = "BLOCKED"; project.error = `Milestone ${milestone.id} merge conflict — resolve manually in ${record.worktreePath}`;
+        } else {
+          project.status = record.status === "BLOCKED" ? "BLOCKED" : record.status === "CANCELLED" ? "CANCELLED" : "FAILED";
+        }
+        project.updatedAt = new Date().toISOString(); writeProjectState(project);
+        break;
+      }
     }
     if (project.status !== "RUNNING") {
       if (project.productManager && project.productManager.state !== "CANCELLED" && project.productManager.state !== "FAILED") { project.productManager.state = "DONE"; writeProductManagerMetadata(project); }
@@ -2378,7 +2574,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     { name: "on", label: "Turn ON", description: "Enable Dual-Gate (default: off)" },
     { name: "off", label: "Turn OFF", description: "Disable Dual-Gate, restore normal Pi" },
     { name: "status", label: "Status", description: "Show current state (models, task, pane, session, project)" },
-    { name: "project", label: "Project", description: "Open PM third pane, approve WBS, then run serial milestones" },
+    { name: "project", label: "Project", description: "Open PM third pane, approve WBS, then run milestone batches (parallel where possible)" },
     { name: "models", label: "Models", description: "Show current model configuration" },
     { name: "controller", label: "Controller / Judge", description: "Pick the Controller/Judge model" },
     { name: "executor", label: "Executor", description: "Pick the Executor model" },
@@ -2475,9 +2671,15 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
             if (project) presentProjectStatus(project);
             else ctx.ui.notify(rest[1] ? `Project ${rest[1]} not found` : "No project in this session; provide a project ID", "info");
           } else if (rest.length) {
-            await runProject(ctx, rest.join(" "));
+            const first = rest[0] ?? "";
+            const repoMatch = first.match(/^repo=(.+)$/);
+            if (repoMatch) {
+              await runProject(ctx, rest.slice(1).join(" "), repoMatch[1]);
+            } else {
+              await runProject(ctx, rest.join(" "));
+            }
           } else {
-            ctx.ui.notify("Usage: /dual project <request> or /dual project status", "info");
+            ctx.ui.notify("Usage: /dual project [repo=<path>] <request> or /dual project status", "info");
           }
           break;
         }
@@ -2575,7 +2777,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
               "Dual-Gate commands:",
               "  /dual on|off               enable / disable",
               "  /dual status               current task/project state",
-              "  /dual project <request>    open PM third pane, plan/approve, then run serial milestones",
+              "  /dual project <request>    open PM third pane, plan/approve, then run milestone batches (parallel where possible)",
               "  /dual project status       project progress",
               "  /dual models               model configuration",
               "  /dual controller [id]      pick controller model",

@@ -165,14 +165,20 @@ export interface ProjectMilestoneContext {
 
 export interface ProjectMilestoneRecord {
   title?: string;
-  status: "PENDING" | "RUNNING" | "CONVERGED" | "BLOCKED" | "FAILED" | "CANCELLED";
+  status: "PENDING" | "RUNNING" | "CONVERGED" | "MERGED" | "MERGE_CONFLICT" | "BLOCKED" | "FAILED" | "CANCELLED";
   taskId?: string;
   taskArtifactDir?: string;
+  /** Worktree path when this milestone ran in an isolated worktree (parallel batch). */
+  worktreePath?: string;
+  /** True when this milestone ran concurrently in its own worktree. */
+  parallel?: boolean;
   summary?: string;
   verdict?: JudgeVerdict;
   unresolved?: string[];
   deviations?: string[];
   completedAt?: string;
+  /** Merge result when parallel execution merged back to the main checkout. */
+  merge?: { outcome: "merged" | "conflict" | "skipped"; message?: string; at?: string };
 }
 
 export type ProductManagerState = "STARTING" | "ACTIVE" | "WAITING" | "RECOVERING" | "FAILED" | "CANCELLED" | "DONE";

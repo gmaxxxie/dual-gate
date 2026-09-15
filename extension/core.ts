@@ -262,12 +262,17 @@ export class TaskManager {
   constructor(cwd: string) { this.cwd = cwd; }
 
   begin(originalRequest: string, models: { controller: ModelRef; executor: ModelRef }, risk: RiskLevel = "low"): TaskRecord {
+    return this.beginFor(this.cwd, originalRequest, models, risk);
+  }
+
+  /** Begin a task whose repository/artifacts live in `cwd` (project repo override). */
+  beginFor(cwd: string, originalRequest: string, models: { controller: ModelRef; executor: ModelRef }, risk: RiskLevel = "low"): TaskRecord {
     const taskId = generateTaskId();
-    const artifactDir = taskDirFor(this.cwd, taskId);
+    const artifactDir = taskDirFor(cwd, taskId);
     const now = new Date().toISOString();
     const record: TaskRecord = {
       taskId,
-      repoPath: normalizeRepoPath(this.cwd),
+      repoPath: normalizeRepoPath(cwd),
       state: "PLANNING",
       originalRequest,
       controllerModel: `${models.controller.provider}/${models.controller.id}`,
@@ -979,6 +984,51 @@ export function parseTolerantYaml(text: string): Record<string, unknown> | null 
     return t;
   }
 
+  /** Split a flow value on top-level commas (respecting brackets and quotes). */
+  function splitFlow(s: string): string[] {
+    const out: string[] = [];
+    let depth = 0; let quote: string | null = null; let cur = "";
+    for (const ch of s) {
+      if (quote) {
+        cur += ch;
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+      if (ch === "[" || ch === "{") { depth++; cur += ch; continue; }
+      if (ch === "]" || ch === "}") { depth--; cur += ch; continue; }
+      if (ch === "," && depth === 0) { out.push(cur); cur = ""; continue; }
+      cur += ch;
+    }
+    if (cur.trim()) out.push(cur);
+    return out;
+  }
+
+  /** Parse a YAML flow-style value: `[a, b, c]` or `{ k: v, k2: [x] }`. */
+  function flowValue(s: string): unknown | undefined {
+    const t = s.trim();
+    if (t.startsWith("[") && t.endsWith("]")) {
+      const inner = t.slice(1, -1).trim();
+      if (!inner) return [];
+      return splitFlow(inner).map((item) => {
+        const v = item.trim();
+        const q = v.match(/^(["'])(.*)\1$/s);
+        return q ? q[2] : scalar(v);
+      }).filter((v) => v !== "" && v !== undefined);
+    }
+    if (t.startsWith("{") && t.endsWith("}")) {
+      const inner = t.slice(1, -1).trim();
+      const out: Record<string, unknown> = {};
+      if (!inner) return out;
+      for (const part of splitFlow(inner)) {
+        const kv = part.trim().match(/^([A-Za-z0-9_.\-]+)\s*:\s*(.*)$/);
+        if (kv) out[kv[1]] = flowValue(kv[2]) ?? scalar(kv[2]);
+      }
+      return out;
+    }
+    return undefined;
+  }
+
   function indentOf(line: string): number {
     return line.length - line.trimStart().length;
   }
@@ -1020,7 +1070,7 @@ export function parseTolerantYaml(text: string): Record<string, unknown> | null 
                 j = child.next;
               } else { j++; }
             } else {
-              out.push({ [key]: scalar(rest) });
+              out.push({ [key]: flowValue(rest) ?? scalar(rest) });
               j++;
             }
           } else {
@@ -1098,7 +1148,7 @@ export function parseTolerantYaml(text: string): Record<string, unknown> | null 
                 i++;
               }
             } else {
-              list.push({ [key]: scalar(rest) });
+              list.push({ [key]: flowValue(rest) ?? scalar(rest) });
               i++;
             }
           } else {
@@ -1145,7 +1195,8 @@ export function parseTolerantYaml(text: string): Record<string, unknown> | null 
         map[key] = [];
         i++;
       } else {
-        map[key] = scalar(rest);
+        const flow = flowValue(rest);
+        map[key] = flow ?? scalar(rest);
         i++;
       }
       lastKey = key;
@@ -1165,12 +1216,20 @@ export function parseTolerantYaml(text: string): Record<string, unknown> | null 
 export function normalizeReport(raw: Record<string, unknown> | null): Record<string, unknown> {
   if (!raw) raw = {};
   const str = (v: unknown): string => (typeof v === "string" ? v : v == null ? "" : String(v));
+  // Models frequently write Python-style `None`, `N/A`, or empty placeholders
+  // in list fields instead of an empty array. Treat those as absent so an
+  // empty unresolved/deviations list does not block convergence.
+  const clean = (v: unknown): string => {
+    const s = str(v).trim().toLowerCase();
+    return s === "none" || s === "null" || s === "n/a" || s === "-" || s === "[]" || s === "" ? "" : str(v);
+  };
   const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : typeof v === "string" && v.trim() ? [{ path: v, purpose: v }] : []);
+  const strArr = (v: unknown): string[] => arr(v).map((x) => (typeof x === "string" ? x : JSON.stringify(x))).map(clean).filter(Boolean);
   return {
     status: raw.status ?? "failed",
     summary: str(raw.summary),
     files_changed: arr(raw.files_changed),
-    implementation: Array.isArray(raw.implementation) ? raw.implementation.map(str) : [],
+    implementation: strArr(raw.implementation),
     tests: raw.tests && typeof raw.tests === "object" ? {
       commands: Array.isArray((raw.tests as any).commands) ? (raw.tests as any).commands.map(str) : [],
       passed: Array.isArray((raw.tests as any).passed) ? (raw.tests as any).passed.map(str) : [],
@@ -1182,9 +1241,9 @@ export function normalizeReport(raw: Record<string, unknown> | null): Record<str
       build: (raw.validation as any).build ?? "not_run",
     } : { lint: "not_run", typecheck: "not_run", build: "not_run" },
     acceptance_check: raw.acceptance_check && typeof raw.acceptance_check === "object" ? raw.acceptance_check : {},
-    deviations: arr(raw.deviations),
-    unresolved: arr(raw.unresolved),
-    risks: arr(raw.risks),
+    deviations: strArr(raw.deviations),
+    unresolved: strArr(raw.unresolved),
+    risks: strArr(raw.risks),
   };
 }
 
@@ -1338,7 +1397,12 @@ export function parseProjectPlan(text: string): ProjectPlan {
     // executor's stricter milestone contract: a list-valued scope describes
     // components, deliverables are expected outcomes, and project validation
     // is inherited when the milestone omits an equivalent command list.
-    return { id: projectString(m.id).toUpperCase(), title: projectString(m.title ?? m.name), depends_on: projectStrings(m.depends_on).map((dep) => dep.toUpperCase()), scope: { files: projectStrings(scope.files), components: projectStrings(scope.components).concat(projectStrings(m.scope), projectStrings(m.tasks), projectStrings(m.work_items)) }, expected_outcome: projectStrings(m.expected_outcome ?? m.deliverables ?? m.tasks ?? m.work_items), acceptance_criteria: projectStrings(m.acceptance_criteria ?? m.completion_criteria ?? m.exit_criteria ?? m.done_when), validation: { required: projectStrings(validation.required ?? m.validation ?? projectValidation.required) }, risk: { level: projectRisk(risk.level), concerns: projectStrings(risk.concerns) } };
+    const scopeItems = projectStrings(scope.components).concat(projectStrings(m.scope), projectStrings(m.tasks), projectStrings(m.work_items), projectStrings(m.objective));
+    const fileItems = projectStrings(scope.files).concat(projectStrings(m.files_touched), projectStrings(m.files));
+    const outcome = projectStrings(m.expected_outcome ?? m.deliverables ?? m.tasks ?? m.work_items ?? m.objective ?? m.validation);
+    const acceptance = projectStrings(m.acceptance_criteria ?? m.acceptance ?? m.completion_criteria ?? m.exit_criteria ?? m.done_when ?? m.deliverables ?? m.verification ?? m.validation);
+    const milestoneValidation = projectStrings(m.validation?.required ?? (m.validation && typeof m.validation === "object" ? undefined : m.validation) ?? m.verification);
+    return { id: projectString(m.id).toUpperCase(), title: projectString(m.title ?? m.name ?? m.id), depends_on: projectStrings(m.depends_on ?? m.dependencies).map((dep) => dep.toUpperCase()), scope: { files: fileItems, components: scopeItems }, expected_outcome: outcome.length ? outcome : scopeItems, acceptance_criteria: acceptance.length ? acceptance : fileItems.length ? fileItems : scopeItems, validation: { required: milestoneValidation.length ? milestoneValidation : projectStrings(projectValidation.required) }, risk: { level: projectRisk(risk.level), concerns: projectStrings(risk.concerns) } };
   });
   const plan: ProjectPlan = { version: typeof raw.version === "number" ? raw.version : 1, goal: projectString(raw.goal), context: projectString(raw.context), constraints: projectStrings(raw.constraints), acceptance_criteria: projectStrings(raw.acceptance_criteria), validation: { required: projectStrings(projectValidation.required ?? raw.validation) }, milestones };
   const errors = validateProjectPlan(plan);
@@ -1358,6 +1422,29 @@ export function topologicallyOrderMilestones(milestones: Milestone[]): Milestone
     remaining.delete(next.id);
   }
   return ordered;
+}
+
+/**
+ * Group an already dependency-ordered milestone list into parallel batches.
+ * Every milestone in a batch has ALL of its dependencies in earlier batches
+ * (never in the same batch), so batch members can safely run concurrently in
+ * isolated worktrees. Batches preserve dependency order.
+ */
+export function scheduleMilestoneBatches(ordered: Milestone[]): Milestone[][] {
+  const batches: Milestone[][] = [];
+  const placed = new Set<string>();
+  while (placed.size < ordered.length) {
+    const batch = ordered.filter((m) => !placed.has(m.id) && m.depends_on.every((d) => placed.has(d.toUpperCase())));
+    if (!batch.length) throw new Error("milestone dependency cycle detected during scheduling");
+    for (const m of batch) placed.add(m.id);
+    batches.push(batch);
+  }
+  return batches;
+}
+
+/** True when a batch has more than one member, so members can run concurrently. */
+export function isParallelBatch(batch: Milestone[]): boolean {
+  return batch.length > 1;
 }
 
 export function milestoneToAcceptanceContract(plan: ProjectPlan, milestone: Milestone, sourceRequest: string): AcceptanceContract {

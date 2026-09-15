@@ -45,6 +45,8 @@ import {
   parseProjectPlan,
   validateProjectPlan,
   topologicallyOrderMilestones,
+  scheduleMilestoneBatches,
+  isParallelBatch,
   milestoneToAcceptanceContract,
   buildProjectPlanPrompt,
   buildProductManagerPlanPrompt,
@@ -319,6 +321,16 @@ test("normalizeReport defaults", () => {
   assert.deepEqual(r.validation, { lint: "not_run", typecheck: "not_run", build: "not_run" });
 });
 
+test("normalizeReport cleans None/null placeholders in list fields", () => {
+  // DeepSeek executor reports often write `unresolved: [None]` instead of an
+  // empty array; that must not block convergence.
+  const r = normalizeReport({ status: "completed", summary: "ok", unresolved: ["None"], deviations: ["None", "n/a"], risks: ["-", "null"], implementation: ["did stuff", "None"] });
+  assert.deepEqual(r.unresolved, []);
+  assert.deepEqual(r.deviations, []);
+  assert.deepEqual(r.risks, []);
+  assert.deepEqual(r.implementation, ["did stuff"]);
+});
+
 test("extractReportFromAgentMessage with fence", () => {
   const msg = `Done.\n\`\`\`yaml\nstatus: completed\nsummary: Implemented feature\nfiles_changed:\n  - path: src/main.ts\n    purpose: added handler\nimplementation:\n  - added the rotate handler\ntests:\n  commands:\n    - npm test\n  passed:\n    - rotate.test.ts\n  failed: []\nvalidation:\n  lint: pass\n  typecheck: pass\n  build: pass\nacceptance_check:\n  rotate_works: pass\ndeviations: []\nunresolved: []\nrisks: []\n\`\`\``;
   const r = extractReportFromAgentMessage(msg);
@@ -332,6 +344,15 @@ test("malformed report still yields normalized shape", () => {
   const r = extractReportFromAgentMessage("I have no idea what happened. 3 bugs found.");
   assert.ok(r); // normalizeReport(null) gives defaults
   assert.equal(r.status, "failed");
+});
+
+test("parseTolerantYaml flow-style map/list with nested arrays", () => {
+  const parsed = parseTolerantYaml("validation: { required: [npm test pass, re-export works] }\nconstraints: [a, b]");
+  assert.deepEqual(parsed?.validation, { required: ["npm test pass", "re-export works"] });
+  assert.deepEqual(parsed?.constraints, ["a", "b"]);
+  const nested = parseTolerantYaml("files: [lib/a.js, tests/clamp.test.js]\nscope: { files: [x], components: [y] }");
+  assert.deepEqual(nested?.files, ["lib/a.js", "tests/clamp.test.js"]);
+  assert.deepEqual(nested?.scope, { files: ["x"], components: ["y"] });
 });
 
 // ---------------------------------------------------------------------------
@@ -737,6 +758,41 @@ test("project plan parses and orders stable WBS", () => {
   assert.equal(plan.goal, "Ship project flow");
   assert.deepEqual(topologicallyOrderMilestones(plan.milestones).map((m) => m.id), ["M1", "M2"]);
   assert.deepEqual(validateProjectPlan(plan), []);
+});
+
+test("parallel milestone scheduler groups independent milestones into batches", () => {
+  // M1 -> M2, M1 -> M3: M2 and M3 are independent and can run in parallel.
+  const milestones: any[] = [
+    { id: "M1", depends_on: [] },
+    { id: "M2", depends_on: ["M1"] },
+    { id: "M3", depends_on: ["M1"] },
+  ];
+  const batches = scheduleMilestoneBatches(milestones);
+  assert.deepEqual(batches.map((b) => b.map((m) => m.id)), [["M1"], ["M2", "M3"]]);
+  assert.ok(isParallelBatch(batches[1]));
+  assert.ok(!isParallelBatch(batches[0]));
+});
+
+test("parallel scheduler handles independent roots and chains", () => {
+  // M1 and M2 independent; M3 depends on both; M4 depends on M3.
+  const milestones: any[] = [
+    { id: "M1", depends_on: [] },
+    { id: "M2", depends_on: [] },
+    { id: "M3", depends_on: ["M1", "M2"] },
+    { id: "M4", depends_on: ["M3"] },
+  ];
+  const batches = scheduleMilestoneBatches(milestones);
+  const ids = batches.map((b) => b.map((m) => m.id).sort().join(","));
+  assert.deepEqual(ids, ["M1,M2", "M3", "M4"]);
+  assert.ok(isParallelBatch(batches[0]));
+});
+
+test("parallel scheduler detects dependency cycles", () => {
+  const milestones: any[] = [
+    { id: "M1", depends_on: ["M2"] },
+    { id: "M2", depends_on: ["M1"] },
+  ];
+  assert.throws(() => scheduleMilestoneBatches(milestones), /cycle/);
 });
 
 test("project plan tolerates real PM output: same-indent lists, name/work_items/done_when, case-insensitive deps", () => {

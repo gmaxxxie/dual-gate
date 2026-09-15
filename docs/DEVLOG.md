@@ -6,6 +6,26 @@
 
 ## 2026-09-15
 
+### 实测：并行里程碑端到端（DeepSeek 全家）
+
+用 DeepSeek 同时作主控/Controller/Judge、PM、Executor，对三里程碑项目（M1/M2 无依赖、M3 依赖两者）完成真实并行验证：
+
+```
+批准后 M1/M2 同时 RUNNING（各自独立 worktree + Executor pane）
+→ M2 先收敛自动 merge 回主 checkout，M1 仍在跑
+→ M1 收敛自动 merge（无冲突，git 历史含两条 Merge branch）
+→ M3（依赖 M1+M2）串行执行 → 收敛
+→ 最终 Gate（15 测试全绿）→ PM 验收 accepted → Controller ratification → ACCEPTED
+```
+
+**本次配套增强**：
+1. `scheduleMilestoneBatches` 按依赖把里程碑分成可并行批次（纯逻辑 + 测试）。
+2. 并行里程碑各用独立 worktree + 自动合并（`commitWorktree` + `mergeWorktreeBack`），测试文件冲突按可累加原则自动解决（`resolveTestFileConflict`），其他冲突 fail-closed 保留 worktree。
+3. `normalizeReport` 清洗 `None`/`null` 等空占位符（DeepSeek 常写 `unresolved: [None]`，否则误判未收敛）。
+4. 宽容 YAML 解析器支持 flow-style `{...}`/`[...]`（DeepSeek 常输出单行流式 map/list），及 `name`/`objective`/`files`/`files_touched`/`dependencies`/`verification`/`deliverables`/`done_when`/`exit_criteria`/`acceptance` 等别名。
+5. `/dual project repo=<path>` 支持对非 pane-cwd 的 Git 仓库跑项目（规避 Herdr 对 git cwd pane 的回收）；任务产物用 `beginFor(repoPath)` 落到仓库内。
+6. 读取 Executor 报告在 agent idle 后加延迟/重试，避免 alternate-screen 未刷新导致空报告。
+
 ### 实测：三 pane 端到端跑通（DeepSeek 全家）
 
 用 `new-api/deepseek-v4-pro` 同时作主控/Controller/Judge、PM 与 Executor 完成真实端到端：
@@ -60,7 +80,7 @@ Controller 规划
 - Stage 2：Repo Memory 共享知识积累
 - Stage 3：并行里程碑（worktree + 多 pane）
 
-**状态**：项目模式现为三 pane：`/dual project <request>` 在 WBS 前创建持久、只读的 Product Manager Herdr pane；主 Pi 校验/展示 WBS 并取得显式确认，里程碑仍以稳定拓扑顺序复用 Executor → Gate → Judge。每个收敛里程碑会向同一 PM 写入有界完成交接；最终 PM 产品验收是 Controller ratification 的强制输入。PM 只允许 `read,grep,find,ls`，所有 IPC 和结果均由主 Pi 持久化于 `.pi/dual-gate/projects/`。PM 丢失仅可 L1 恢复一次，失败 fail closed；无跨重启 in-flight resume、作用域 Gate 或并行。`worktree.mode: isolated` 仍在项目入口被拒绝。
+**状态**：项目模式现为三 pane：`/dual project <request>` 在 WBS 前创建持久、只读的 Product Manager Herdr pane；主 Pi 校验/展示 WBS 并取得显式确认。里程碑按依赖有序批次调度：**同批无依赖里程碑并行**（各自独立 worktree + Executor pane），收敛后自动合并回主 checkout（Executor 改动先提交到分支再 merge；测试文件冲突按可累加原则自动解决，其他冲突 fail-closed 并保留 worktree）；依赖的里程碑进入后续批次。每个收敛里程碑会向同一 PM 写入有界完成交接；最终 PM 产品验收是 Controller ratification 的强制输入。PM 只允许 `read,grep,find,ls` + 产物目录受限的 `write`，所有 IPC 和结果均由主 Pi 持久化于 `.pi/dual-gate/projects/`。PM 丢失仅可 L1 恢复一次，失败 fail closed；无跨重启 in-flight resume、作用域 Gate。`worktree.mode: isolated` 仍在项目入口被拒绝。
 
 ---
 
