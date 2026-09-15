@@ -42,6 +42,7 @@ import {
   generateProjectId,
   projectDirFor,
   projectMilestoneDirFor,
+  loadProjectsFromDisk,
   parseProjectPlan,
   validateProjectPlan,
   topologicallyOrderMilestones,
@@ -937,6 +938,46 @@ test("project lifecycle only treats nonterminal states as active", () => {
   assert.ok(isProjectFinalizationStopped("CANCELLED", false));
   assert.ok(isProjectFinalizationStopped("ACCEPTING", true));
   assert.ok(!isProjectFinalizationStopped("ACCEPTING", false));
+});
+
+test("TaskManager.loadFromDisk restores interrupted tasks from artifacts", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dg-restore-"));
+  const root = join(dir, ".pi", "dual-gate");
+  mkdirSync(join(root, "task-20260915-abcd"), { recursive: true });
+  writeFileSync(join(root, "task-20260915-abcd", "state.json"), JSON.stringify({
+    taskId: "task-20260915-abcd", state: "EXECUTING", currentStage: "iteration-1", iteration: 1,
+    expectedVersion: 1, gapCount: 0, previousGapCount: 0, progress: "improving", sameGapStreak: 0,
+    executorStuck: false, specRevisions: 0, repoPath: dir, createdAt: "2026-09-15T00:00:00.000Z", updatedAt: "2026-09-15T00:00:00.000Z",
+  }));
+  writeFileSync(join(root, "task-20260915-abcd", "metadata.json"), JSON.stringify({
+    taskId: "task-20260915-abcd", controller: "new-api/deepseek-v4-pro", executor: "default",
+    herdrPanel: null, herdrAgent: null, state: "EXECUTING", createdAt: "2026-09-15T00:00:00.000Z",
+  }));
+  // A terminal task should not be returned as resumable.
+  mkdirSync(join(root, "task-20260915-done"), { recursive: true });
+  writeFileSync(join(root, "task-20260915-done", "state.json"), JSON.stringify({ taskId: "task-20260915-done", state: "DONE" }));
+  writeFileSync(join(root, "task-20260915-done", "metadata.json"), JSON.stringify({ taskId: "task-20260915-done" }));
+
+  const tm = new TaskManager(dir);
+  const resumed = tm.loadFromDisk(dir);
+  assert.equal(resumed.length, 1);
+  assert.equal(resumed[0].taskId, "task-20260915-abcd");
+  assert.equal(resumed[0].state, "EXECUTING");
+  assert.equal(resumed[0].controllerModel, "new-api/deepseek-v4-pro");
+  assert.equal(resumed[0].artifactDir, join(root, "task-20260915-abcd"));
+  assert.equal(tm.persistedTasks().length, 2);
+
+  // Project restoration.
+  mkdirSync(join(root, "projects", "project-20260915-0001"), { recursive: true });
+  writeFileSync(join(root, "projects", "project-20260915-0001", "project-state.json"), JSON.stringify({
+    projectId: "project-20260915-0001", sourceRequest: "x", repoPath: dir,
+    artifactDir: join(root, "projects", "project-20260915-0001"), status: "RUNNING",
+    orderedMilestoneIds: ["M1"], milestones: { M1: { title: "M1", status: "RUNNING" } },
+    createdAt: "2026-09-15T00:00:00.000Z", updatedAt: "2026-09-15T00:00:00.000Z",
+  }));
+  const projects = loadProjectsFromDisk(dir);
+  assert.equal(projects.length, 1);
+  assert.equal(projects[0].status, "RUNNING");
 });
 
 test("project acceptance parser and guards reject incomplete, unresolved, or failed gate", () => {

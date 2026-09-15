@@ -215,7 +215,9 @@ Also: DIAGNOSING (iteration threshold → Convergence Diagnosis), WAITING_PERMIS
 
 - **L1 Live Context**: the DeepSeek session (the pi process inside the pane).
 - **L2 Durable Context**: Expected / Actual / Delta / Checkpoint / Diff / Gate.
-- If L1 is lost (pane reaped / crash) while the extension session remains active, recover with L2 in a **new pane** (titled `· recovered`), prompting "Continue the existing task, do not restart from scratch". A Pi restart preserves artifacts for inspection but does not yet resume an in-flight loop automatically.
+- If L1 is lost (pane reaped / crash) while the extension session remains active, recover with L2 in a **new pane** (titled `· recovered`), prompting "Continue the existing task, do not restart from scratch".
+- **Cross-restart recovery**: on Pi restart, `session_start` scans `.pi/dual-gate/` and restores interrupted task/project records (state.json + project-state.json). `/dual status` lists recoverable items; `/dual resume <taskId>` continues a task from its persisted spec/checkpoint, and `/dual resume project <projectId> [repo=<path>]` re-enters a stalled project — skipping already-CONVERGED milestones, respawning a lost PM pane, and continuing unmerged milestones. Works even when the pane cwd differs from the repo via `repo=`.
+- **Repo Memory**: each converged milestone appends durable knowledge (summary, files changed, implementation notes) to `.pi/dual-gate/projects/<id>/repo-memory.md`; later milestones receive it via the executor prompt (`## REPO MEMORY`), so they do not cold-start re-explore the repository.
 
 ## Known Environment Facts (verified on this machine)
 

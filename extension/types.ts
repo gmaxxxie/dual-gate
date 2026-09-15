@@ -168,6 +168,8 @@ export interface ProjectMilestoneContext {
   scope: Milestone["scope"];
   dependsOn: string[];
   completedSummaries: Array<{ milestoneId: string; title: string; summary: string; verdict: JudgeVerdict }>;
+  /** Shared repo knowledge accumulated by earlier milestones (Repo Memory). */
+  repoMemory?: string;
 }
 
 export interface ProjectMilestoneRecord {

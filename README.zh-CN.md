@@ -216,6 +216,8 @@ IDLE → PLANNING → SPAWNING_EXECUTOR → EXECUTING → GATING
 - **L1 Live Context**：DeepSeek session（pane 内 pi 进程）。
 - **L2 Durable Context**：Expected / Actual / Delta / Checkpoint / Diff / Gate。
 - 若 L1 丢失（pane 回收 / crash / restart），用 L2 在**新 pane**（标题 `· recovered`）恢复，提示 "Continue the existing task, do not restart from scratch"。
+- **跨重启恢复**：Pi 重启后 `session_start` 扫描 `.pi/dual-gate/`，从 `state.json` / `project-state.json` 恢复中断的任务与项目记录。`/dual status` 列出可恢复项；`/dual resume <taskId>` 从持久化 spec/checkpoint 续跑任务，`/dual resume project <projectId> [repo=<path>]` 重进停滞项目——跳过已 CONVERGED 的里程碑、重建丢失的 PM pane、继续未合并的里程碑。pane cwd 与仓库不同时可用 `repo=` 指定。
+- **Repo Memory**：每个收敛里程碑把持久知识（摘要、变更文件、实现要点）追加到 `.pi/dual-gate/projects/<id>/repo-memory.md`；后续里程碑经 Executor prompt（`## REPO MEMORY`）接收，无需冷启动重新探索仓库。
 
 ## 已知环境事实（本机验证）
 

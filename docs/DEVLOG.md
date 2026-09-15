@@ -6,6 +6,18 @@
 
 ## 2026-09-15
 
+### 实测：跨重启恢复 + Repo Memory（DeepSeek 全家）
+
+**跨重启恢复**：
+- `TaskManager.loadFromDisk` + `loadProjectsFromDisk` 从磁盘恢复中断的任务/项目；`session_start` 自动扫描并提示。
+- `/dual resume <taskId>` 从持久化 spec 续跑任务；`/dual resume project <id> [repo=<path>]` 重进停滞项目。
+- 实测：运行中杀主控 pane → 重启 → resume → 跳过已 CONVERGED 里程碑、自动重建 PM pane、M1/M2 并行续跑 → 全部收敛 → PM+Controller 双验收 ACCEPTED（16 测试全绿）。
+- 修复 3 个 bug：CONVERGED 里程碑的历史 unresolved 备注不再阻塞最终复核；final_acceptance 纯 YAML（含 prompt 示例 fenced 尾巴）解析修复；resume 后旧响应文件误读（请求前删除旧 response.yaml）。
+
+**Repo Memory**：
+- 每个收敛里程碑把摘要/变更文件/实现要点追加到 `repo-memory.md`，后续里程碑经 Executor prompt 的 `## REPO MEMORY` 段接收。
+- 实测 M3 明确参考了 memory 中的跨里程碑上下文（清理无关残留、保持导出面一致）。
+
 ### 实测：市场调研先行（Product Manager 联网调研）
 
 给 PM pane 新增只读 `pm_search` 工具（`pm-search.ts`，走 Tavily/Exa，来自 `~/.pi/web-search.json`），规划 prompt 强制「先调研 → 复用/借鉴/自研决策 → 再写 WBS」。

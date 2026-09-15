@@ -9,7 +9,7 @@
 // with spec versioning and convergence detection.
 // =============================================================================
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { join, resolve, basename, dirname } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -75,6 +75,7 @@ import {
   trackConvergence,
   sameJudgeGaps,
   TaskManager,
+  loadProjectsFromDisk,
   type ModelRegistryAdapter,
   type ArtifactStore,
   type TaskRecord,
@@ -959,7 +960,7 @@ function presentPlanningSummary(task: TaskRecord, contract: AcceptanceContract, 
 // The closed-loop orchestration
 // ---------------------------------------------------------------------------
 
-async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, options: { initialContract?: AcceptanceContract; projectContext?: ProjectMilestoneContext; suppressGlobalFlags?: boolean } = {}): Promise<void> {
+async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, options: { initialContract?: AcceptanceContract; projectContext?: ProjectMilestoneContext; suppressGlobalFlags?: boolean; resumeFromCheckpoint?: boolean } = {}): Promise<void> {
   const rt = getRuntime();
   const config = rt.config;
   const store = makeStore(task);
@@ -982,6 +983,17 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, optio
       store.write("task.md", `# Task ${task.taskId}\n\n## Original Request\n${task.originalRequest}\n`);
       writeSpecVersioned(store, contract.version, contract);
       presentPlanningSummary(task, contract, "project plan");
+    } else if (options.resumeFromCheckpoint) {
+      // Restart an interrupted task: reuse the latest persisted spec (no new
+      // Controller planning) and continue the closed loop from its progress.
+      const raw = store.read("spec.yaml");
+      if (!raw) {
+        throw new Error(`cannot resume ${task.taskId}: spec.yaml missing`);
+      }
+      contract = JSON.parse(raw) as AcceptanceContract;
+      rt.manager.patch(task.taskId, { expectedVersion: contract.version });
+      writeState(task, store);
+      ctx.ui.notify(`Dual-Gate: resuming ${task.taskId} from checkpoint (spec v${contract.version})`, "info");
     } else {
       contract = await plan(ctx, task, config, store);
     }
@@ -1894,6 +1906,9 @@ async function requestProductManager<T>(ctx: ExtensionCommandContext, project: P
   const prefix = pmRequestPrefix(kind, payload);
   const store = productManagerStore(project);
   const responsePath = join(store.dir(), `${prefix}-response.yaml`);
+  // Remove any stale response from a previous request so the completion poll
+  // cannot mistake it for this request's answer (resume reuses the same file).
+  try { if (existsSync(responsePath)) rmSync(responsePath); } catch { /* best-effort */ }
   const prompt = promptFor(requestId, responsePath);
   // Persist before transport so an L1 recovery can replay exactly this request.
   pm.lastRequestId = requestId; pm.lastRequestKind = kind; pm.state = "WAITING";
@@ -2293,7 +2308,7 @@ function presentProjectStatus(project: ProjectRecord): void {
   showText(lines.join("\n"));
 }
 
-async function runProject(ctx: ExtensionCommandContext, request: string, repoOverride?: string): Promise<void> {
+async function runProject(ctx: ExtensionCommandContext, request: string, repoOverride?: string, resumeProject?: ProjectRecord): Promise<void> {
   const rt = getRuntime();
   const config = rt.config;
   // A repoOverride (from `/dual project repo=<path> <request>`) lets the
@@ -2304,63 +2319,104 @@ async function runProject(ctx: ExtensionCommandContext, request: string, repoOve
     ctx.ui.notify("Dual-Gate project mode requires worktree.mode auto or current; isolated milestones cannot share changes.", "error");
     return;
   }
-  if (rt.running || rt.manager.active() || (rt.activeProject && isActiveProjectState(rt.activeProject.status))) {
+  if (!resumeProject && (rt.running || rt.manager.active() || (rt.activeProject && isActiveProjectState(rt.activeProject.status)))) {
     ctx.ui.notify("Dual-Gate already has an active task or project", "warning");
     return;
   }
-  if (config.product_manager.model !== "default" && !findAvailableAuthenticatedModel(makeRegistry(ctx), config.product_manager.model)) {
+  if (!resumeProject && config.product_manager.model !== "default" && !findAvailableAuthenticatedModel(makeRegistry(ctx), config.product_manager.model)) {
     ctx.ui.notify(`Product Manager model is not available with configured authentication: ${config.product_manager.model}`, "error");
     return;
   }
   rt.running = true;
   rt.stopRequested = false;
-  const projectId = generateProjectId();
+  const projectId = resumeProject?.projectId ?? generateProjectId();
   const artifactDir = projectDirFor(repoPath, projectId);
   const store = createArtifactStore(artifactDir);
   const now = new Date().toISOString();
-  let project: ProjectRecord = { projectId, sourceRequest: request, repoPath, artifactDir, status: "PLANNING", orderedMilestoneIds: [], milestones: {}, productManager: { model: config.product_manager.model, state: "STARTING", recoveryCount: 0 }, createdAt: now, updatedAt: now };
+  let project: ProjectRecord = resumeProject ?? { projectId, sourceRequest: request, repoPath, artifactDir, status: "PLANNING", orderedMilestoneIds: [], milestones: {}, productManager: { model: config.product_manager.model, state: "STARTING", recoveryCount: 0 }, createdAt: now, updatedAt: now };
   rt.activeProject = project;
-  writeProjectState(project);
+  if (!resumeProject) writeProjectState(project);
   try {
     const registry = makeRegistry(ctx);
     const controller = registry.find(config.controller.model) ?? { provider: "", id: config.controller.model, name: config.controller.model };
-    // The PM is created once before WBS generation and persists through final acceptance.
-    await spawnProductManager(ctx, project, config);
-    const plan = await requestProductManager(ctx, project, config, "plan", { source_request: request, repo_path: project.repoPath }, (requestId, responsePath) => buildProductManagerPlanPrompt({ sourceRequest: request, repoPath: project.repoPath, requestId, responsePath }), (raw, requestId) => {
-      try {
-        const block = extractCorrelatedYamlBlock(raw, requestId, "plan") ?? raw;
-        const plan = parseProjectPlan(block);
-        return plan;
-      } catch { return null; }
-    });
-    const ordered = topologicallyOrderMilestones(plan.milestones);
-    project.orderedMilestoneIds = ordered.map((m) => m.id);
-    for (const m of ordered) project.milestones[m.id] = { title: m.title, status: "PENDING" };
-    store.write("project-plan.yaml", JSON.stringify(plan, null, 2));
-    project.status = "AWAITING_APPROVAL"; project.updatedAt = new Date().toISOString(); writeProjectState(project);
-    showText(projectPlanDisplay(plan, projectId));
-    const approved = await ctx.ui.confirm("Approve project plan", `Execute ${ordered.length} milestones in dependency-ordered batches${scheduleMilestoneBatches(ordered).some((b) => b.length > 1) ? " (independent milestones run in parallel worktrees)" : ""} for: ${plan.goal}?`);
-    store.write("project-approval.json", { approved, at: new Date().toISOString() });
-    if (!approved || project.status === "CANCELLED" || rt.stopRequested) {
-      project.status = "CANCELLED"; project.updatedAt = new Date().toISOString();
-      if (project.productManager) {
-        project.productManager.state = "CANCELLED";
-        if (project.productManager.paneId) await exec("herdr", ["pane", "rename", project.productManager.paneId, `${deriveProductManagerTitle(project.projectId, project.repoPath)} · CANCELLED`], { timeoutMs: 15_000 }).catch(() => {});
-        writeProductManagerMetadata(project);
+    let plan: ProjectPlan;
+    if (resumeProject) {
+      // Resume: reuse the persisted plan; do not re-plan or re-approve.
+      const raw = store.read("project-plan.yaml");
+      if (!raw) throw new Error(`cannot resume ${project.projectId}: project-plan.yaml missing`);
+      plan = JSON.parse(raw) as ProjectPlan;
+      ctx.ui.notify(`Dual-Gate: resuming project ${project.projectId} — continuing unmerged milestones…`, "info");
+      // The PM pane may have died with the previous session; rebuild it if
+      // its agent no longer resolves, so milestone feedback/acceptance work.
+      const pmAgent = project.productManager?.agentName;
+      const pmState = pmAgent ? await herdrAgentGet({ target: pmAgent }) : null;
+      const pmAlive = !!pmState?.state || !!pmState?.idle;
+      if (!pmAlive) {
+        ctx.ui.notify("Dual-Gate: PM pane lost — respawning…", "warning");
+        if (project.productManager?.paneId) {
+          await herdrPaneClose(project.productManager.paneId).catch(() => {});
+          project.productManager.paneId = undefined;
+          project.productManager.agentName = undefined;
+        }
+        await spawnProductManager(ctx, project, config);
       }
-      writeProjectState(project); return;
+      project.status = "RUNNING"; project.updatedAt = new Date().toISOString(); writeProjectState(project);
+    } else {
+      // The PM is created once before WBS generation and persists through final acceptance.
+      await spawnProductManager(ctx, project, config);
+      plan = await requestProductManager(ctx, project, config, "plan", { source_request: request, repo_path: project.repoPath }, (requestId, responsePath) => buildProductManagerPlanPrompt({ sourceRequest: request, repoPath: project.repoPath, requestId, responsePath }), (raw, requestId) => {
+        try {
+          const block = extractCorrelatedYamlBlock(raw, requestId, "plan") ?? raw;
+          const plan = parseProjectPlan(block);
+          return plan;
+        } catch { return null; }
+      });
+      const ordered0 = topologicallyOrderMilestones(plan.milestones);
+      project.orderedMilestoneIds = ordered0.map((m) => m.id);
+      for (const m of ordered0) project.milestones[m.id] = { title: m.title, status: "PENDING" };
+      store.write("project-plan.yaml", JSON.stringify(plan, null, 2));
+      project.status = "AWAITING_APPROVAL"; project.updatedAt = new Date().toISOString(); writeProjectState(project);
+      showText(projectPlanDisplay(plan, projectId));
+      const approved = await ctx.ui.confirm("Approve project plan", `Execute ${ordered0.length} milestones in dependency-ordered batches${scheduleMilestoneBatches(ordered0).some((b) => b.length > 1) ? " (independent milestones run in parallel worktrees)" : ""} for: ${plan.goal}?`);
+      store.write("project-approval.json", { approved, at: new Date().toISOString() });
+      if (!approved || project.status === "CANCELLED" || rt.stopRequested) {
+        project.status = "CANCELLED"; project.updatedAt = new Date().toISOString();
+        if (project.productManager) {
+          project.productManager.state = "CANCELLED";
+          if (project.productManager.paneId) await exec("herdr", ["pane", "rename", project.productManager.paneId, `${deriveProductManagerTitle(project.projectId, project.repoPath)} · CANCELLED`], { timeoutMs: 15_000 }).catch(() => {});
+          writeProductManagerMetadata(project);
+        }
+        writeProjectState(project); return;
+      }
+      project.status = "RUNNING"; project.updatedAt = new Date().toISOString(); writeProjectState(project);
     }
-    project.status = "RUNNING"; project.updatedAt = new Date().toISOString(); writeProjectState(project);
+    const ordered = topologicallyOrderMilestones(plan.milestones);
+    // Reconcile plan milestones with persisted records (resume may already
+    // have CONVERGED ones; keep their status and task refs).
+    for (const m of ordered) {
+      if (!project.milestones[m.id]) project.milestones[m.id] = { title: m.title, status: "PENDING" };
+    }
     const completed: ProjectMilestoneContext["completedSummaries"] = [];
     const batches = scheduleMilestoneBatches(ordered);
     for (const batch of batches) {
       if (project.status !== "RUNNING") break;
       const parallel = isParallelBatch(batch);
-      ctx.ui.notify(`Dual-Gate: executing milestone batch ${batches.indexOf(batch) + 1}/${batches.length}${parallel ? ` (${batch.length} parallel)` : ""}…`, "info");
+      // Resume support: milestones already CONVERGED in a previous session are
+      // skipped (their changes are already merged into the main checkout).
+      const pendingBatch = batch.filter((m) => project.milestones[m.id]?.status !== "CONVERGED");
+      if (pendingBatch.length === 0) {
+        for (const m of batch) {
+          if (project.milestones[m.id]?.status === "CONVERGED") {
+            completed.push({ milestoneId: m.id, title: m.title, summary: project.milestones[m.id].summary ?? "", verdict: "converged" });
+          }
+        }
+        continue;
+      }
+      ctx.ui.notify(`Dual-Gate: executing milestone batch ${batches.indexOf(batch) + 1}/${batches.length}${parallel ? ` (${pendingBatch.length} parallel)` : ""}…`, "info");
 
       // Run every milestone in this batch, concurrently when the batch is
       // parallel (each in its own worktree), serially otherwise.
-      const results = await Promise.all(batch.map(async (milestone) => {
+      const results = await Promise.all(pendingBatch.map(async (milestone) => {
         const record = project.milestones[milestone.id];
         const milestoneStore = createArtifactStore(projectMilestoneDirFor(repoPath, projectId, milestone.id));
         project.currentMilestoneId = milestone.id; record.status = "RUNNING"; project.updatedAt = new Date().toISOString(); writeProjectState(project);
@@ -2382,7 +2438,9 @@ async function runProject(ctx: ExtensionCommandContext, request: string, repoOve
           record.worktreePath = worktreePath;
         }
 
-        const context: ProjectMilestoneContext = { projectId, projectGoal: plan.goal, milestoneId: milestone.id, milestoneTitle: milestone.title, scope: milestone.scope, dependsOn: milestone.depends_on, completedSummaries: [...completed] };
+        const repoMemoryPath = join(store.dir(), "repo-memory.md");
+        const repoMemory = existsSync(repoMemoryPath) ? readFileSync(repoMemoryPath, "utf8").slice(0, 12000) : undefined;
+        const context: ProjectMilestoneContext = { projectId, projectGoal: plan.goal, milestoneId: milestone.id, milestoneTitle: milestone.title, scope: milestone.scope, dependsOn: milestone.depends_on, completedSummaries: [...completed], repoMemory };
         await orchestrate(ctx, task, { initialContract: contract, projectContext: context, suppressGlobalFlags: true });
         rt.running = true; // the task runner clears its own flag; the project still owns input
         const taskStore = makeStore(task);
@@ -2457,6 +2515,22 @@ async function runProject(ctx: ExtensionCommandContext, request: string, repoOve
           productManagerStore(project).write(`milestone-${milestone.id}-feedback.yaml`, persistedFeedback);
           if (pmFeedback.decision === "blocked") { project.status = "BLOCKED"; project.error = pmFeedback.reason; project.updatedAt = new Date().toISOString(); writeProjectState(project); break; }
           completed.push({ milestoneId: milestone.id, title: milestone.title, summary: record.summary ?? "", verdict: "converged" });
+          // Repo Memory: accumulate durable knowledge for later milestones.
+          const memoryPath = join(store.dir(), "repo-memory.md");
+          const memFile = existsSync(memoryPath) ? readFileSync(memoryPath, "utf8") : "";
+          const memReport = extractReportFromAgentMessage(taskStore.read("executor-report.yaml") ?? "");
+          const memFiles = (memReport.files_changed as Array<{ path?: string; purpose?: string }> | undefined) ?? [];
+          const fileNote = memFiles.length ? memFiles.map((f) => `  - ${f.path ?? ""}${f.purpose ? ` — ${f.purpose}` : ""}`).join("\n") : "  - (none)";
+          const implNote = Array.isArray(memReport.implementation) && memReport.implementation.length ? memReport.implementation.slice(0, 4).map((s) => `  - ${String(s).slice(0, 300)}`).join("\n") : "";
+          const memoryEntry = [
+            `## ${milestone.id}: ${milestone.title}`,
+            `- ${(record.summary ?? "").slice(0, 600)}`,
+            "- Files:", fileNote,
+            implNote ? "- Implementation notes:" : "",
+            implNote,
+            "",
+          ].filter((l) => l !== "").join("\n");
+          writeFileSync(memoryPath, (memFile ? memFile + "\n" : "") + memoryEntry, "utf8");
         }
       }
 
@@ -2487,7 +2561,14 @@ async function runProject(ctx: ExtensionCommandContext, request: string, repoOve
     finalStore.write("final-gate.log", formatGateResult(finalGate));
     const diff = await getDiff(project.repoPath);
     if (isProjectFinalizationStopped(project.status, rt.stopRequested)) return;
-    const milestoneResults = ordered.map((m) => ({ milestoneId: m.id, title: m.title, summary: project.milestones[m.id].summary ?? "", verdict: project.milestones[m.id].verdict ?? "", unresolved: project.milestones[m.id].unresolved ?? [], deviations: project.milestones[m.id].deviations ?? [] }));
+    const milestoneResults = ordered.map((m) => {
+      const rec = project.milestones[m.id];
+      // A CONVERGED milestone's historical unresolved notes were resolved by
+      // its own Judge; passing them to final ratification would make the
+      // Controller reject on stale evidence.
+      const unresolved = rec?.status === "CONVERGED" ? [] : (rec?.unresolved ?? []);
+      return { milestoneId: m.id, title: m.title, summary: rec?.summary ?? "", verdict: rec?.verdict ?? "", unresolved, deviations: rec?.deviations ?? [] };
+    });
     const productAcceptance = await requestProductManager(ctx, project, config, "final_acceptance", { plan, milestones: milestoneResults, gate_summary: formatGateResult(finalGate), diff }, (requestId, responsePath) => buildProductAcceptancePrompt({ requestId, responsePath, plan, milestones: milestoneResults, diff, gateSummary: formatGateResult(finalGate) }), parseProjectAcceptance);
     if (isProjectFinalizationStopped(project.status, rt.stopRequested)) return;
     project.productAcceptance = productAcceptance; writeProjectState(project);
@@ -2542,6 +2623,19 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", (_event, ctx) => {
     rt.manager = new TaskManager(ctx.cwd);
+    // Restore interrupted task/project records from disk (crash/restart).
+    try {
+      const resumedTasks = rt.manager.loadFromDisk(ctx.cwd);
+      const projects = loadProjectsFromDisk(ctx.cwd);
+      const activeProject = projects.find((p) => isActiveProjectState(p.status)) ?? null;
+      rt.activeProject = activeProject;
+      if (resumedTasks.length || activeProject) {
+        ctx.ui.notify(
+          `Dual-Gate: recovered ${resumedTasks.length} interrupted task(s)${activeProject ? ` + project ${activeProject.projectId} (${activeProject.status})` : ""} — run /dual status or /dual resume`,
+          "warning",
+        );
+      }
+    } catch { /* recovery is best-effort */ }
     updateWidget(ctx);
   });
 
@@ -2764,9 +2858,42 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
           break;
         }
         case "resume": {
-          const t = rt.manager.active();
+          // /dual resume project <projectId> — restart a stalled project.
+          if (rest[0]?.toLowerCase() === "project") {
+            const projectId = rest[1];
+            const repoMatch = rest.slice(2).find((a) => a.startsWith("repo="));
+            const repoScan = repoMatch ? repoMatch.slice(5) : ctx.cwd;
+            const projects = loadProjectsFromDisk(repoScan);
+            const project = projects.find((p) => p.projectId === projectId) ?? (rt.activeProject?.projectId === projectId ? rt.activeProject : null);
+            if (!project || !isActiveProjectState(project.status)) {
+              ctx.ui.notify(projectId ? `Project ${projectId} not found or not resumable (scanned ${repoScan})` : "Usage: /dual resume project <projectId> [repo=<path>]", "info");
+              break;
+            }
+            rt.activeProject = project;
+            rt.running = true;
+            rt.stopRequested = false;
+            ctx.ui.notify(`Dual-Gate: resuming project ${projectId} (${project.status}) — continuing milestones…`, "info");
+            // Re-enter the project executor at its current milestone. The
+            // milestone loop re-reads project-state.json and skips converged
+            // milestones via their record status.
+            await runProject(ctx, project.sourceRequest, project.repoPath, project);
+            rt.running = false;
+            updateWidget(ctx);
+            break;
+          }
+          const t = rest[0] ? rt.manager.persistedTasks().find((x) => x.taskId === rest[0] || x.taskId.startsWith(rest[0]!)) : rt.manager.active();
           if (!t) {
-            ctx.ui.notify("Dual-Gate: no active task", "info");
+            ctx.ui.notify(rest[0] ? `Task ${rest[0]} not found` : "Dual-Gate: no active task", "info");
+            break;
+          }
+          if (rest[0] && ["DONE", "FAILED", "CANCELLED", "ESCALATED"].includes(t.state)) {
+            ctx.ui.notify(`Task ${t.taskId} is terminal (${t.state}); nothing to resume`, "info");
+            break;
+          }
+          if (rest[0]) {
+            // Resume an interrupted (restart-recovered) task from checkpoint.
+            await orchestrate(ctx, t, { resumeFromCheckpoint: true });
+            updateWidget(ctx);
             break;
           }
           if (t.state !== "PAUSED") {
@@ -2860,6 +2987,16 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
         lines.push(`  Task ${task.taskId}`);
       } else {
         lines.push("", "State", "  Idle");
+      }
+      // Interrupted tasks/projects from a previous session (recoverable).
+      const interrupted = rt.manager.all().filter((t) => !["DONE", "FAILED", "CANCELLED", "ESCALATED"].includes(t.state));
+      if (!task && interrupted.length) {
+        lines.push("", "Recoverable tasks", ...interrupted.map((t) => `  ${t.taskId} · ${t.state} · ${t.originalRequest.slice(0, 60)}`), "  Run: /dual resume <taskId>");
+      }
+      const persistedProjects = loadProjectsFromDisk(rt.manager.all()[0]?.repoPath ?? ctx.cwd);
+      const stalledProjects = persistedProjects.filter((p) => isActiveProjectState(p.status) && p.projectId !== rt.activeProject?.projectId);
+      if (stalledProjects.length) {
+        lines.push("", "Recoverable projects", ...stalledProjects.map((p) => `  ${p.projectId} · ${p.status} · milestone ${p.currentMilestoneId ?? "-"}`), "  Run: /dual resume project <projectId>");
       }
     } else {
       lines.push("DUAL-GATE OFF (normal Pi)");

@@ -8,7 +8,7 @@
 // injected via an ArtifactStore interface.
 // =============================================================================
 
-import { mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import type {
@@ -197,6 +197,23 @@ export function projectMilestoneDirFor(cwd: string, projectId: string, milestone
   return join(projectDirFor(cwd, projectId), "milestones", milestoneId);
 }
 
+/** Load persisted project records under `<cwd>/.pi/dual-gate/projects/`. */
+export function loadProjectsFromDisk(cwd: string): ProjectRecord[] {
+  const root = join(artifactRoot(cwd), "projects");
+  let dirs: string[] = [];
+  try { dirs = readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory() && d.name.startsWith("project-")).map((d) => d.name); } catch { return []; }
+  const out: ProjectRecord[] = [];
+  for (const dir of dirs) {
+    try {
+      const p = join(root, dir, "project-state.json");
+      if (!existsSync(p)) continue;
+      const rec = JSON.parse(readFileSync(p, "utf8")) as ProjectRecord;
+      if (rec && rec.projectId) out.push(rec);
+    } catch { /* skip corrupt */ }
+  }
+  return out;
+}
+
 export function normalizeRepoPath(cwd: string): string {
   return resolve(cwd);
 }
@@ -344,6 +361,69 @@ export class TaskManager {
     return this.transition(t.taskId, "CANCELLED");
   }
 
+  /**
+   * Load task records persisted under the dual-gate task artifact directory.
+   * Returns the non-terminal tasks that were interrupted (crash / restart)
+   * and can be resumed. Each is restored from state.json + metadata.json.
+   */
+  loadFromDisk(cwd: string): TaskRecord[] {
+    const root = artifactRoot(cwd);
+    let dirs: string[] = [];
+    try { dirs = readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory() && d.name.startsWith("task-")).map((d) => d.name); } catch { return []; }
+    const restored: TaskRecord[] = [];
+    for (const dir of dirs) {
+      const base = join(root, dir);
+      const stPath = join(base, "state.json");
+      const metaPath = join(base, "metadata.json");
+      let st: Record<string, unknown>;
+      try { st = JSON.parse(readFileSync(stPath, "utf8")); } catch { continue; }
+      const taskId = String(st.taskId ?? dir);
+      let meta: Record<string, unknown> = {};
+      try { meta = JSON.parse(readFileSync(metaPath, "utf8")); } catch { /* metadata optional */ }
+      const state = (typeof st.state === "string" && st.state) ? st.state as TaskState : "FAILED";
+      const record: TaskRecord = {
+        taskId,
+        repoPath: String(meta.repoPath ?? st.repoPath ?? cwd),
+        state,
+        originalRequest: String(st.originalRequest ?? ""),
+        controllerModel: String(meta.controller ?? ""),
+        executorModel: String(meta.executor ?? ""),
+        herdrPanelId: (st.herdrPanelId as string) ?? (meta.herdrPanel as string) ?? null,
+        herdrAgentName: (st.herdrAgentName as string) ?? (meta.herdrAgent as string) ?? null,
+        worktreePath: (st.worktreePath as string) ?? null,
+        panelCreated: Boolean(meta.herdrPanel ?? st.herdrPanelId),
+        gateFailures: Number(st.gateFailures ?? 0),
+        judgeFailures: Number(st.judgeFailures ?? 0),
+        iteration: Number(st.iteration ?? 0),
+        expectedVersion: Number(st.expectedVersion ?? 1),
+        gapCount: Number(st.gapCount ?? 0),
+        previousGapCount: Number(st.previousGapCount ?? 0),
+        progress: (st.progress === "improving" || st.progress === "stalled" || st.progress === "worsening") ? st.progress : "stalled",
+        sameGapStreak: Number(st.sameGapStreak ?? 0),
+        executorStuck: Boolean(st.executorStuck),
+        specRevisions: Number(st.specRevisions ?? 0),
+        currentStage: String(st.currentStage ?? "restored"),
+        artifactDir: base,
+        createdAt: String(st.createdAt ?? meta.createdAt ?? ""),
+        updatedAt: String(st.updatedAt ?? ""),
+        bypassNext: false,
+        risk: (st.risk === "low" || st.risk === "medium" || st.risk === "high") ? st.risk : "low",
+        error: typeof st.error === "string" ? st.error : undefined,
+      };
+      this.tasks.set(taskId, record);
+      if (!["DONE", "FAILED", "CANCELLED", "ESCALATED"].includes(state)) {
+        this.activeTaskId = taskId;
+        restored.push(record);
+      }
+    }
+    return restored;
+  }
+
+  /** List all tasks (terminal + active) loaded from disk. */
+  persistedTasks(): TaskRecord[] {
+    return [...this.tasks.values()];
+  }
+
   setBypassNext(v: boolean): void {
     this.bypassNext = v;
   }
@@ -396,7 +476,10 @@ export function formatProjectContext(context?: ProjectMilestoneContext): string 
   const prior = context.completedSummaries.length
     ? context.completedSummaries.map((x) => `- ${x.milestoneId} (${x.verdict}): ${x.summary}`).join("\n")
     : "- none";
-  return `\n## PROJECT / MILESTONE CONTEXT (authoritative boundary)\nPROJECT: ${context.projectId} — ${context.projectGoal}\nMILESTONE: ${context.milestoneId} — ${context.milestoneTitle}\nDEPENDENCIES: ${context.dependsOn.join(", ") || "none"}\nSCOPE: ${scope}\nCOMPLETED MILESTONES:\n${prior}\nDo not regress completed milestones or work outside this milestone scope.`;
+  const memory = context.repoMemory?.trim()
+    ? `\n## REPO MEMORY (learned by earlier milestones — trust it, verify only what you touch)\n${context.repoMemory.trim()}`
+    : "";
+  return `\n## PROJECT / MILESTONE CONTEXT (authoritative boundary)\nPROJECT: ${context.projectId} — ${context.projectGoal}\nMILESTONE: ${context.milestoneId} — ${context.milestoneTitle}\nDEPENDENCIES: ${context.dependsOn.join(", ") || "none"}\nSCOPE: ${scope}\nCOMPLETED MILESTONES:\n${prior}${memory}\nDo not regress completed milestones or work outside this milestone scope.`;
 }
 
 export function buildExecutorPrompt(input: {
@@ -1585,13 +1668,20 @@ export function buildProjectAcceptancePrompt(input: { plan: ProjectPlan; milesto
 }
 
 export function parseProjectAcceptance(text: string, requestId?: string): ProjectAcceptance | null {
-  const block = requestId ? (extractCorrelatedYamlBlock(text, requestId) ?? text) : extractYamlBlock(text);
-  const raw = parseTolerantYaml(block ?? text);
-  if (!raw || (requestId && (raw.protocol_version !== 1 || raw.request_id !== requestId || raw.kind !== "final_acceptance")) || (raw.verdict !== "accepted" && raw.verdict !== "gaps" && raw.verdict !== "blocked")) return null;
-  const summary = projectString(raw.summary);
-  const reason = projectString(raw.reason);
-  if (!summary || !reason || !Array.isArray(raw.satisfied) || !Array.isArray(raw.gaps) || !Array.isArray(raw.unresolved)) return null;
-  return { verdict: raw.verdict, summary, satisfied: projectStrings(raw.satisfied), gaps: projectStrings(raw.gaps), unresolved: projectStrings(raw.unresolved), reason };
+  // A pure-YAML artifact (PM wrote the response file directly) may still carry
+  // the prompt's example fenced block as a tail. Prefer parsing the whole text
+  // as YAML first (validating correlation); fall back to the correlated fence.
+  const candidates: Array<string | null> = [text, requestId ? extractCorrelatedYamlBlock(text, requestId) : extractYamlBlock(text)];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const raw = parseTolerantYaml(candidate);
+    if (!raw || (requestId && (raw.protocol_version !== 1 || raw.request_id !== requestId || raw.kind !== "final_acceptance")) || (raw.verdict !== "accepted" && raw.verdict !== "gaps" && raw.verdict !== "blocked")) continue;
+    const summary = projectString(raw.summary);
+    const reason = projectString(raw.reason);
+    if (!summary || !reason || !Array.isArray(raw.satisfied) || !Array.isArray(raw.gaps) || !Array.isArray(raw.unresolved)) continue;
+    return { verdict: raw.verdict, summary, satisfied: projectStrings(raw.satisfied), gaps: projectStrings(raw.gaps), unresolved: projectStrings(raw.unresolved), reason };
+  }
+  return null;
 }
 
 export function isActiveProjectState(status: ProjectState): boolean {
