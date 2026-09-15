@@ -227,7 +227,7 @@ cd /path/to/dual-gate
 node --experimental-strip-types tests/core.test.ts   # core assertions
 ```
 
-Covers: config defaults/normalization/invalid values, task id/title/agent name, state machine transitions, convergence tracking, risk detection, YAML/Execution Report/Judge parsing (converged/implementation_gap/spec_gap/blocked), contract/spec-revision/diagnosis parsing, prompt building (initial/delta-fix/judge), artifact store, gate discovery (node/python/go/no command), gate running (pass/fail).
+Covers: config defaults/normalization/invalid values, task id/title/agent name, state machine transitions, convergence tracking, risk detection, YAML/Execution Report/Judge parsing (converged/implementation_gap/spec_gap/blocked), contract/spec-revision/diagnosis parsing, prompt building (initial/delta-fix/judge), artifact store, gate discovery (node/python/go/no command), gate running (pass/fail), project WBS parsing/validation/stable topological ordering, milestone→contract projection, PM launch policy and plan/feedback/acceptance IPC correlation, project lifecycle/cancellation/acceptance guards.
 
 ## End-to-End Verification (real runs)
 
@@ -238,6 +238,20 @@ The authenticated, mutating end-to-end demo targets this checkout's `demo-repo/`
 3. `agent prompt` (with REPOSITORY + Expected Outcome) → DeepSeek actually executes in the pane: cd to repo, implement `detectTabletMode`, discover the `node --test tests/` directory-arg problem and fix package.json, `npm test` 1/1 pass
 4. Second prompt (Delta: handle undefined) → **same session** completes the incremental fix, final `return attached !== true`, tests pass
 5. `agent read` observes the whole execution process
+
+### Three-pane project mode (verified live)
+
+A full project run was executed live with DeepSeek as Controller/Judge, Product Manager, and Executor (no Codex):
+
+```
+PM pane (DeepSeek) → WBS plan → main Controller validates + user approves
+  → Executor pane runs M1 → Gate + Judge converge
+  → PM milestone feedback → Executor pane runs M2 → converge
+  → final Gate (npm test 4/4) → PM product acceptance (accepted)
+  → Controller ratification (accepted) → project ACCEPTED
+```
+
+Verified artifacts under `.pi/dual-gate/projects/<id>/`: `plan.yaml`, per-milestone `milestone-<M>-feedback.yaml` / `task-ref.json`, `product-acceptance.yaml`, `controller-ratification.yaml`, `project-state.json` (`status: ACCEPTED`).
 
 ---
 

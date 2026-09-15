@@ -227,7 +227,7 @@ cd /home/max/dual-gate
 node --experimental-strip-types tests/core.test.ts
 ```
 
-覆盖：config 默认/规范化/非法值、模型解析与 PM 的严格可用/已认证模型校验、task id/标题/agent 名、状态机转移、收敛跟踪、风险检测、YAML/Execution Report/Judge 解析（converged/implementation_gap/spec_gap/blocked）、contract/spec-revision/diagnosis 解析、prompt 构建（initial/delta-fix/judge）、项目 WBS/依赖排序/里程碑契约、PM 只读启动参数及计划/交接反馈/最终产品验收的 prompt+response IPC 关联、artifact store、gate 发现（node/python/go/无命令）、gate 运行（pass/fail）。
+覆盖：config 默认/规范化/非法值、模型解析与 PM 的严格可用/已认证模型校验、task id/标题/agent 名、状态机转移、收敛跟踪、风险检测、YAML/Execution Report/Judge 解析（converged/implementation_gap/spec_gap/blocked）、contract/spec-revision/diagnosis 解析、prompt 构建（initial/delta-fix/judge）、artifact store、gate 发现（node/python/go/无命令）、gate 运行（pass/fail）、项目 WBS 解析/校验/稳定拓扑排序、里程碑→契约投影、PM 启动参数与计划/交接反馈/产品验收的 IPC 关联、项目生命周期/取消/验收守卫。
 
 ## 端到端验证记录（真实运行）
 
@@ -238,6 +238,20 @@ node --experimental-strip-types tests/core.test.ts
 3. `agent prompt`（含 REPOSITORY + Expected Outcome）→ DeepSeek 在 pane 内真实执行：cd 到 repo、实现 `detectTabletMode`、发现 `node --test tests/` 目录参数问题并修复 package.json、`npm test` 1/1 pass
 4. 第二个 prompt（Delta：处理 undefined）→ **同一 session** 完成增量修复，最终 `return attached !== true`，测试通过
 5. `agent read` 全程可观察执行过程
+
+### 三 pane 项目模式（实测）
+
+已用 DeepSeek 同时作 Controller/Judge、Product Manager、Executor 完成一次完整真实运行（不依赖 Codex）：
+
+```
+PM pane（DeepSeek）→ WBS 计划 → 主 Controller 校验并让用户批准
+  → Executor pane 执行 M1 → Gate + Judge 收敛
+  → PM 里程碑反馈 → Executor pane 执行 M2 → 收敛
+  → 最终 Gate（npm test 4/4）→ PM 产品验收（accepted）
+  → Controller ratification（accepted）→ 项目 ACCEPTED
+```
+
+实测产物见 `.pi/dual-gate/projects/<id>/`：`plan.yaml`、每个里程碑的 `milestone-<M>-feedback.yaml` / `task-ref.json`、`product-acceptance.yaml`、`controller-ratification.yaml`、`project-state.json`（`status: ACCEPTED`）。
 
 ---
 
