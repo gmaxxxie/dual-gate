@@ -46,6 +46,13 @@ export interface DgConfig {
   worktree: { mode: "auto" | "current" | "isolated" };
   context: { send_full_executor_history_to_judge: boolean };
   ui: { show_widget: boolean };
+  /** Reflex Layer (System-1). OFF by default; observe first, enforce later. */
+  reflex: {
+    enabled: boolean;
+    mode: "observe" | "enforce";
+    backend: "rule" | "jev" | "hybrid";
+    jev_deadline_ms: number;
+  };
 }
 
 export interface AcceptanceContract {

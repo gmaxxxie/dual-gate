@@ -4,6 +4,96 @@
 
 ---
 
+## 2026-09-19
+
+### Reflex Layer v0.2c：真实环境端到端验证 + 安装同步 + 语义修正
+
+**同步**：`install.sh` 修复——原来只复制顶层 `*.ts`，漏了 `reflex/` 子目录；已改为递归复制，并重新执行安装（`~/.pi/agent/extensions/dual-gate/reflex/*.ts` 全部就位，syntax + load 通过）。
+
+**真实环境端到端验证**（用 demo-repo 实际工作树 + 真实 gate + 真实 Jev CLI）：
+- 场景 1（健全）：executor 报告 `completed` + 真实 gate PASS（`npm test` 154ms）+ 3 测试全过 → `finish=completed(evidence_satisfied) score=0.80` → `loop=CONTINUE`（进 GPT-5.6 Judge）✅
+- 场景 2（unverified）：executor 说 `completed` 但 validation 全 not_run + 无 test 命令 → `needs_fix/unverified_claim` → `RETRY`（同一 pane，**连 Jev 都不花**，硬规则拦截）✅
+- 审计产物：`demo-repo/.pi/dual-gate/reflex-e2e/reflex-it1.log` + `reflex-history.json`（真实写入，验证了 orchestrate 的产物路径）
+
+**语义修正（重要 bug）**：`finish.ts` 的 build/tests check 原逻辑在 gate 已通过时把 `build: not_run` 算失败，导致健全案例（gate 通过 + tests 全过）被误判 `needs_fix`（真实 Jev 都拒绝）。修正：**gate 通过 = 权威信号，build/tests 的 not_run 不再扣分（gate 已覆盖项目验证），只有显式 fail 才扣分**。修正后健全案例 score 0.8 → completed，模糊带案例（tests 报告有失败）仍正确落进 Jev 判定区。
+
+**验证脚本**：`scripts/reflex-e2e-real.ts`（真实 Jev，需要 CLI，可选运行）；单测 `tests/reflex.test.ts` 18/18 覆盖同等逻辑（fake Jev）。
+
+**测试**：reflex 18/18，core 68/68，全部安装产物 syntax + load 通过。
+
+---
+
+## 2026-09-19
+
+### Reflex Layer v0.2b：接入 orchestrate()（Jev 分流 GPT-5.6 Judge）
+
+把含 Jev 的 `runReflexLayer` 接入 `orchestrate()` 循环，实现研究文档 §9.1 的插入点。**当前默认 OFF + observe**（`/dual reflex on` 启用，`/dual reflex observe|enforce` 切换模式）。
+
+**接线（4 个真实锚点，均为 dual-gate.ts orchestrate()）**：
+1. **report 读取后、deterministic gate 前**：收集 IterationState + Honest Finish 预检——拦截 `unverified_claim`（自称完成但没跑验证）→ 同 pane RETRY，**不花 GPT-5.6**
+2. **gate 通过后、Judge 前**：完整 reflex（含 gate 证据 + Jev）→ enforce 模式下 `RETRY`/`RETRY_WITH_HINT` → 同 pane 模板 hint 后 continue（跳过 Judge）；`ESCALATE` → 落入现有 Judge/升级路径；`CONTINUE` → Judge
+3. **gate-fix 循环内**：同一步骤重复失败 → steer hint（确定性，不盲目重试）
+4. **finally**：清理 reflex status widget
+
+**新增**：`/dual reflex` 子命令（on/off/observe/enforce/status）；`DgConfig.reflex` 配置段（enabled/mode/backend/jev_deadline_ms）；`reflex-history.json` + `reflex-itN.log` 审计产物；helper `collectIterationState`/`loadReflexHistory`/`persistReflexHistory`/`runReflex`/`gitNameOnly`。
+
+**集成实测**（真实 Jev CLI，模拟 orchestrate 数据流）：
+- 证据充分（score=0.8）→ `completed` → `CONTINUE`（不调 Jev，直接进 Judge）
+- 证据不足（score=0.4，低于 jev_low_band）→ `needs_fix` → `RETRY`（规则直接判，不调 Jev）
+- **模糊带（score=0.6）→ Jev `goal_met` 被调用 → `jev_rejected:insufficient_evidence` → `RETRY`（同一 pane，绕过 GPT-5.6 Judge）** ✅ 核心价值
+
+**测试**：`tests/reflex.test.ts` 18/18 绿（+`jev band retry flow`：rule-only / Jev-reject / Jev-confirm 三态）。`tests/core.test.ts` 68/68。`extension/` 三个文件 syntax + load 全部 OK。
+
+---
+
+## 2026-09-19
+
+### Reflex Layer v0.2：接入 Jev System One（Jev 优先，规则兑底）
+
+确认本机 `~/.local/bin/jev` 可用（TypeSafe Jev-1.13，走 OpenRouter Decisions API + `~/.pi/agent/auth.json` openrouter key），实测 **~0.5s / $0.00002 每次**。按用户选择接入：**Jev 优先，规则兑底**，目标是**分流 GPT-5.6 调用次数**（不是降单次思考档——Jev 不能加速 LLM 推理，只能把普通判断前置到 0.5s）。
+
+**关键架构**：`S1Backend` 接口（borrow Bicameral `s1-runtime/src/types.ts`）：
+- `JevBackend`（新）— 调本地 `jev` CLI（`--json`），无新增运行时依赖；超时/失败抛错
+- `RuleBackend` — 确定性信号作为伪答案
+- policy `backend: rule|jev|hybrid`（默认 hybrid = Jev 优先规则兑底，borrow Bicameral degraded fallback）
+
+**接入点（执行结果返回后，进 GPT-5.6 Judge 前）**：
+- `finish.ts: decideFinishWithJev` — 模糊带（score 在 jev_low_band=0.6 ~ complete_threshold=0.8，或 evidence-complete-but-flagged）问 Jev `goal_met` noul；Jev 确认 → completed，Jev 拒绝 → needs_fix，超时 → 规则判定
+- `progress.ts: decideStuckWithJev` — NO_PROGRESS 处于 watch zone（internal streak >= jev_after=2 且 < no_progress_stuck_after=3）问 Jev `no_progress`；Jev ≥0.7 → STUCK
+- `index.ts: runReflexLayer` 改为 async，注入 `JevClient`（`makeJevClient`），输出 `jevConsulted` 审计字段
+
+**真实端到端实测**（非 fake）：
+- 证据不足 → `finish=needs_fix(jev_rejected:insufficient_evidence) score=0.60 → loop=RETRY`（省掉一次 GPT-5.6 Judge）✓
+- 证据充分 → `finish=completed(evidence_satisfied) score=1.00 → loop=CONTINUE` ✓
+
+**测试**：`tests/reflex.test.ts` 17/17 绿（新增：policy backend 字段、Jev finish 模糊带三种情况、Jev stuck watch-zone）。`tests/core.test.ts` 68/68 仍绿。
+
+**未接线**：orchestrate() 的 6 个插入点仍留待接线（Reflex 层本身已具备 Jev 能力，等接入循环后以 observe 模式灰度）。
+
+---
+
+## 2026-09-19
+
+### Reflex Layer v0.1（纯函数实现，未接线）
+
+对 [AbdelStark/bicameral](https://github.com/AbdelStark/bicameral) 做了源码级分析（`research/bicameral-herdr-integration.md`，725 行），提取 Gate / Honest Finish / Stuck / Policy 模式，按 dual-gate 架构重写为**零 token 确定性 Reflex Layer**。
+
+**关键架构判断**：Bicameral 的 hook（`tool_call`/`tool_result`/`turn_end`）都在主 Pi 会话，而我们的 Executor 跑在独立 Herdr pane，主会话 hook 触发不到 → 不能照搬接线；Reflex 必须是 orchestrate() 循环内的显式调用（纯函数层）。
+
+**新增 `extension/reflex/`（纯函数，无模型调用，无 I/O）**：
+- `types.ts` — 共享类型 + `DEFAULT_REFLEX_POLICY` + `mergeReflexPolicy`/`normalizeReflexPolicy`（JSON overlay，`mode: observe|enforce`）
+- `risk-tier.ts` — Tool Risk Gate：borrow Bicameral `isHighRiskByPattern`/`isOutsideCwd`，扩展为 LOW/MEDIUM/HIGH/CRITICAL tier（只读→LOW 自动；rm -rf/git reset --hard/force push→CRITICAL；网络/sudo/credential→HIGH；包安装→MEDIUM）
+- `finish.ts` — Honest Finish：evidence checklist（gate 实际跑过且通过 / build 非 not_run / tests 0 失败 / files 有变更 / acceptance 全 pass）+ 红旗启发式（stub/test 弱化/scope escape/unverified claim/silent failure）→ 完成度评分 → completed/needs_fix/escalate
+- `progress.ts` — Progress/Stuck：`compareState`（tests 8→5→2 = PROGRESS，error signature 变化 = PROGRESS，连续相同 = NO_PROGRESS，build pass→fail = REGRESSION）+ `preSignals`（borrow Bicameral StuckTracker：同命令同错误 / 同文件两 hunk 振荡）
+- `policy.ts` — Escalation Policy：CONTINUE / RETRY / RETRY_WITH_HINT / ESCALATE（只有 ESCALATE 才进 GPT-5.6 Judge / 用户）
+- `index.ts` — `runReflexLayer()` 编排 + `formatReflexResult` 审计
+
+**测试**：`tests/reflex.test.ts` 14 项全绿（risk tier 分类、test 弱化/stub/scope 检测、完成判断边界、progress 比较、stuck 判定、escalation 映射）。`tests/core.test.ts` 68 项仍全绿。
+
+**未接线**（v0.1 只做纯函数层，符合研究结论）：orchestrate() 的 6 个插入点（loop 顶部收集 IterationState、waitForExecutorCompletion 后 Honest Finish 预检查、gate 结果后合并证据、gate-fix 循环内 stuck 干预、trackConvergence 后 escalation、TaskRecord 持久化 reflex 字段）留待 v0.2 接线。
+
+---
+
 ## 2026-09-15
 
 ### 实测：跨重启恢复 + Repo Memory（DeepSeek 全家）

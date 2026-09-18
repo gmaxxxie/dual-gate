@@ -75,6 +75,7 @@ export const DEFAULT_CONFIG: DgConfig = {
   worktree: { mode: "auto" },
   context: { send_full_executor_history_to_judge: false },
   ui: { show_widget: true },
+  reflex: { enabled: false, mode: "observe", backend: "hybrid", jev_deadline_ms: 2000 },
 };
 
 export function normalizeConfig(raw: Partial<DgConfig> | null | undefined): DgConfig {
@@ -117,6 +118,13 @@ export function normalizeConfig(raw: Partial<DgConfig> | null | undefined): DgCo
   }
   if (r.ui && typeof r.ui === "object") {
     if (typeof r.ui.show_widget === "boolean") c.ui.show_widget = r.ui.show_widget;
+  }
+  if (r.reflex && typeof r.reflex === "object") {
+    const rf = r.reflex as Record<string, unknown>;
+    if (typeof rf.enabled === "boolean") c.reflex.enabled = rf.enabled;
+    if (rf.mode === "observe" || rf.mode === "enforce") c.reflex.mode = rf.mode;
+    if (rf.backend === "rule" || rf.backend === "jev" || rf.backend === "hybrid") c.reflex.backend = rf.backend;
+    if (typeof rf.jev_deadline_ms === "number" && Number.isFinite(rf.jev_deadline_ms) && rf.jev_deadline_ms > 0) c.reflex.jev_deadline_ms = Math.floor(rf.jev_deadline_ms);
   }
   return c;
 }

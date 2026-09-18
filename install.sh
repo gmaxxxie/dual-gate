@@ -12,10 +12,14 @@ echo "  dest:   $DEST_DIR"
 mkdir -p "$DEST_DIR"
 cp "$SRC_DIR"/*.ts "$DEST_DIR/" 2>/dev/null || true
 cp "$SRC_DIR"/package.json "$DEST_DIR/" 2>/dev/null || true
+# Reflex Layer subdirectory (reflex/*.ts) — required for the System-1 layer.
+mkdir -p "$DEST_DIR/reflex"
+cp "$SRC_DIR"/reflex/*.ts "$DEST_DIR/reflex/" 2>/dev/null || true
 
 echo ""
 echo "Installed files:"
 ls -1 "$DEST_DIR"/*.ts 2>/dev/null | sed "s|$HOME|~|"
+ls -1 "$DEST_DIR"/reflex/*.ts 2>/dev/null | sed "s|$HOME|~|"
 
 echo ""
 echo "Dual-Gate requires Herdr. Checking…"

@@ -88,6 +88,10 @@ import {
 } from "./core.ts";
 import type { ProjectPlan, ProjectRecord, ProjectMilestoneContext, ProductManagerRecord, ProjectMilestoneFeedback } from "./types.ts";
 import { discoverGateCommands, runGate, formatGateResult, skippedGateResult, type GateResult } from "./gate.ts";
+import { runReflexLayer, makeJevClient, formatReflexResult, type JevClient, type ReflexRunInput, type ReflexResult } from "./reflex/index.ts";
+import { JevBackend } from "./reflex/backend.ts";
+import { normalizeReflexPolicy, type ReflexPolicy, type IterationState, type TurnSignal, type LoopAction } from "./reflex/types.ts";
+import { pushWindow } from "./reflex/progress.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -346,6 +350,12 @@ function saveConfig(patch: Partial<ReturnType<typeof normalizeConfig>>): void {
         ...(base.executor ?? {}),
         ...(patch.executor as Partial<typeof base.executor>),
       } as typeof base.executor;
+    }
+    if (patch.reflex && typeof patch.reflex === "object") {
+      merged.reflex = {
+        ...(base.reflex ?? {}),
+        ...(patch.reflex as Partial<typeof base.reflex>),
+      } as typeof base.reflex;
     }
 
     // Atomic write: write temp file then rename, so a crash mid-write can't
@@ -1050,6 +1060,22 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, optio
     let lastJudge: JudgeOutput | null = null;
     let executorActive = false;
 
+    // ---- Reflex Layer (System-1) runtime state ----
+    const reflexEnabled = config.reflex.enabled;
+    const reflexPolicy: ReflexPolicy = normalizeReflexPolicy({
+      mode: config.reflex.mode,
+      backend: config.reflex.backend,
+      jev_deadline_ms: config.reflex.jev_deadline_ms,
+    });
+    const reflexJev: JevClient | undefined =
+      reflexEnabled && config.reflex.backend !== "rule"
+        ? makeJevClient(new JevBackend(), reflexPolicy)
+        : undefined;
+    // Persisted reflex history (survives pause/resume within one orchestrate call).
+    let reflexHistory = loadReflexHistory(store);
+    let iterStates: IterationState[] = [];
+    let turnSignals: TurnSignal[] = [];
+
     while (iteration < maxIterations) {
       if (taskStopped(task)) return;
       iteration += 1;
@@ -1210,6 +1236,43 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, optio
       store.write(`execution-report-it${iteration}.yaml`, JSON.stringify(report, null, 2));
       store.write(`execution-report-raw-it${iteration}.md`, finalText);
 
+      // ---- Reflex: collect iteration state + Honest Finish pre-check ----
+      // (before the deterministic gate: intercept "claimed done but never ran
+      // any validation" without spending a GPT-5.6 Judge call).
+      if (reflexEnabled) {
+        const filesChanged = await gitNameOnly(cwd);
+        const diffText = await getDiff(cwd);
+        const state: IterationState = collectIterationState({ iteration, report, gate: null, diffText, filesChanged });
+        iterStates = pushWindow(iterStates, state, reflexPolicy.progress.window);
+        // Pre-check: if the executor claims completed but never ran any
+        // validation and there's no gate yet, flag unverified_claim.
+        const preResult = await runReflex(ctx, task, store, config, { policy: reflexPolicy, jev: reflexJev, history: reflexHistory, iterStates, turnSignals }, {
+          iteration,
+          report,
+          gate: null,
+          diffText,
+          filesChanged,
+          cwd,
+          state,
+          turns: turnSignals,
+        });
+        if (preResult?.finish?.verdict === "needs_fix" && preResult.finish.reason === "unverified_claim") {
+          // Executor claimed done without running the gate — RETRY same pane
+          // with a template hint, never calling GPT-5.6.
+          ctx.ui.notify("Dual-Gate reflex: unverified_claim — asking executor to run validation", "warning");
+          const hint = preResult.finish.hint ?? "Run the deterministic gate (test/lint/build) before claiming done.";
+          const send = await herdrAgentPrompt({ target: task.herdrAgentName!, text: `[Reflex] ${hint}`, wait: false, timeoutMs: 120_000 });
+          if (taskStopped(task)) return;
+          if (!send.ok) throw new Error(`reflex unverified prompt failed: ${send.error}`);
+          reflexHistory.retryCount += 1;
+          persistReflexHistory(store, reflexHistory);
+          await waitForExecutorCompletion(task, config, { shouldStop: () => taskStopped(task) });
+          if (taskStopped(task)) return;
+          continue; // re-read report next iteration
+        }
+        persistReflexHistory(store, { ...reflexHistory, states: iterStates, turns: turnSignals });
+      }
+
       // ---- Deterministic gate ----
       if (taskStopped(task)) return;
       rt.manager.patch(task.taskId, { state: "GATING", currentStage: "gating" });
@@ -1227,6 +1290,22 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, optio
         });
         writeState(task, store);
         ctx.ui.notify(`Dual-Gate: Gate FAIL — sending fix to same pane (${gateLoop + 1}/${config.gate.max_retries})`, "warning");
+
+        // ---- Reflex: gate-fix stuck check (no progress on same failing step) ----
+        // If the same gate step keeps failing with the same error, steer the
+        // executor to change approach instead of blindly retrying (deterministic).
+        if (reflexEnabled && gateLoop > 0) {
+          const sameStepFails = gateResult.steps
+            .filter((s) => !s.passed && !s.skipped)
+            .every((s) => firstReflexErrorLine({ passed: false, steps: [s] }) === firstReflexErrorLine({ passed: false, steps: [s] }));
+          const stuckHint = "[Reflex] The same validation step keeps failing with the same error. Stop repeating the same fix; read the error carefully, inspect the relevant files, change approach, then retry once.";
+          if (sameStepFails) {
+            ctx.ui.notify("Dual-Gate reflex: same gate error repeating — steering executor", "warning");
+            const send = await herdrAgentPrompt({ target: task.herdrAgentName!, text: stuckHint, wait: false, timeoutMs: 120_000 });
+            if (taskStopped(task)) return;
+            if (!send.ok) throw new Error(`reflex gate-stuck prompt failed: ${send.error}`);
+          }
+        }
 
         const gateErrors = gateResult.steps.filter((s) => !s.passed && !s.skipped)
           .map((s) => `[${s.name}] ${s.command}\n${s.outputTail}`)
@@ -1273,6 +1352,63 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, optio
       diff = await getDiff(cwd);
       if (taskStopped(task)) return;
       const gateSummary = formatGateResult(gateResult);
+
+      // ---- Reflex (System-1): full pass with gate evidence, before Judge ----
+      // Jev/rule decide whether this iteration even needs the expensive GPT-5.6
+      // Judge. CONTINUE → Judge; RETRY → same pane with template hint; ESCALATE
+      // → fall through to existing escalation (Judge / user / stronger model).
+      let reflexAction: LoopAction | null = null;
+      if (reflexEnabled) {
+        const filesChanged = await gitNameOnly(cwd);
+        const state: IterationState = collectIterationState({ iteration, report, gate: gateResult, diffText: diff, filesChanged });
+        iterStates = pushWindow(iterStates, state, reflexPolicy.progress.window);
+        const result = await runReflex(ctx, task, store, config, { policy: reflexPolicy, jev: reflexJev, history: reflexHistory, iterStates, turnSignals }, {
+          iteration,
+          report,
+          gate: { passed: gateResult.passed, steps: gateResult.steps },
+          diffText: diff,
+          filesChanged,
+          cwd,
+          state,
+          turns: turnSignals,
+        });
+        if (result) {
+          reflexAction = result.loop.action;
+          reflexHistory.jevConsulted = result.jevConsulted;
+          reflexHistory.noProgressStreak = result.trend === "NO_PROGRESS" ? reflexHistory.noProgressStreak + 1 : 0;
+          reflexHistory.sameErrorStreak =
+            reflexHistory.states.length > 0 &&
+            reflexHistory.states[reflexHistory.states.length - 1].errorSignature !== "" &&
+            state.errorSignature === reflexHistory.states[reflexHistory.states.length - 1].errorSignature
+              ? reflexHistory.sameErrorStreak + 1
+              : 0;
+          reflexHistory.states = iterStates;
+          reflexHistory.turns = turnSignals;
+          persistReflexHistory(store, reflexHistory);
+
+          if (config.reflex.mode === "enforce") {
+            if (reflexAction === "RETRY" || reflexAction === "RETRY_WITH_HINT") {
+              // Same pane, same session — send template hint, skip GPT-5.6 Judge.
+              ctx.ui.notify(`Dual-Gate reflex: ${reflexAction} — sending to same pane`, "warning");
+              const hint = result.finish?.hint ?? result.stuck?.hint ?? "Reflex: evidence incomplete; complete the flagged checks and rerun validation.";
+              const send = await herdrAgentPrompt({ target: task.herdrAgentName!, text: `[Reflex] ${hint}`, wait: false, timeoutMs: 120_000 });
+              if (taskStopped(task)) return;
+              if (!send.ok) throw new Error(`reflex retry prompt failed: ${send.error}`);
+              reflexHistory.retryCount += 1;
+              persistReflexHistory(store, reflexHistory);
+              await waitForExecutorCompletion(task, config, { shouldStop: () => taskStopped(task) });
+              if (taskStopped(task)) return;
+              continue; // re-enter loop → gate → reflex again
+            }
+            if (reflexAction === "ESCALATE") {
+              ctx.ui.notify("Dual-Gate reflex: ESCALATE — routing to System-2 Judge", "warning");
+              // fall through to Judge below (existing escalation paths handle verdicts)
+            }
+            // CONTINUE → Judge below
+          }
+        }
+      }
+
       let judgeOutput: JudgeOutput | null = null;
       let judgeError: unknown;
       for (let attempt = 0; attempt <= config.judge.max_retries; attempt++) {
@@ -1533,6 +1669,7 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, optio
       rt.running = false;
       updateWidget(ctx);
       setStatus(ctx, undefined);
+      try { ctx.ui.setStatus("dual-gate-reflex", undefined); } catch { /* ignore */ }
     }
   }
 }
@@ -1986,6 +2123,164 @@ async function pauseCheckpoint(
 }
 
 // ---------------------------------------------------------------------------
+// Reflex Layer (System-1) integration helpers
+// ---------------------------------------------------------------------------
+
+/** Reflex history persisted in the task artifact dir (survives pause/resume). */
+interface ReflexHistory {
+  states: IterationState[];
+  noProgressStreak: number;
+  sameErrorStreak: number;
+  turns: TurnSignal[];
+  jevConsulted: string[];
+  retryCount: number;
+}
+
+const EMPTY_REFLEX_HISTORY: ReflexHistory = {
+  states: [],
+  noProgressStreak: 0,
+  sameErrorStreak: 0,
+  turns: [],
+  jevConsulted: [],
+  retryCount: 0,
+};
+
+function loadReflexHistory(store: ArtifactStore): ReflexHistory {
+  try {
+    const raw = store.read("reflex-history.json");
+    if (!raw) return structuredClone(EMPTY_REFLEX_HISTORY);
+    const parsed = JSON.parse(raw) as Partial<ReflexHistory>;
+    return {
+      states: Array.isArray(parsed.states) ? parsed.states : [],
+      noProgressStreak: typeof parsed.noProgressStreak === "number" ? parsed.noProgressStreak : 0,
+      sameErrorStreak: typeof parsed.sameErrorStreak === "number" ? parsed.sameErrorStreak : 0,
+      turns: Array.isArray(parsed.turns) ? parsed.turns : [],
+      jevConsulted: Array.isArray(parsed.jevConsulted) ? parsed.jevConsulted : [],
+      retryCount: typeof parsed.retryCount === "number" ? parsed.retryCount : 0,
+    };
+  } catch {
+    return structuredClone(EMPTY_REFLEX_HISTORY);
+  }
+}
+
+function persistReflexHistory(store: ArtifactStore, h: ReflexHistory): void {
+  try {
+    store.write("reflex-history.json", JSON.stringify(h, null, 2));
+  } catch { /* audit is best-effort */ }
+}
+
+/** Build an IterationState from the report + gate + diff (mirrors reflex/types.ts). */
+function collectIterationState(input: {
+  iteration: number;
+  report: Record<string, unknown>;
+  gate: GateResult | null;
+  diffText: string;
+  filesChanged: string[];
+}): IterationState {
+  const r = input.report;
+  const tests = (r.tests && typeof r.tests === "object" ? r.tests : {}) as Record<string, unknown>;
+  const testsPassed = Array.isArray(tests.passed) ? (tests.passed as unknown[]).length : 0;
+  const testsFailed = Array.isArray(tests.failed) ? (tests.failed as unknown[]).length : 0;
+  const validation = (r.validation && typeof r.validation === "object" ? r.validation : {}) as Record<string, unknown>;
+  const build = typeof validation.build === "string" ? validation.build : "not_run";
+  const acceptance = (r.acceptance_check && typeof r.acceptance_check === "object" ? r.acceptance_check : {}) as Record<string, unknown>;
+  const reqCompleted = Object.values(acceptance).filter((v) => String(v) === "pass").length;
+  const reqTotal = Object.keys(acceptance).length;
+  const errorSignature =
+    input.gate && !input.gate.passed
+      ? firstReflexErrorLine(input.gate)
+      : "";
+  return {
+    iteration: input.iteration,
+    filesChanged: input.filesChanged,
+    testsPassed,
+    testsFailed,
+    buildStatus: build === "pass" ? "pass" : build === "fail" ? "fail" : "not_run",
+    errorSignature,
+    diffSize: countReflexDiffLines(input.diffText),
+    requirementsCompleted: reqCompleted,
+    requirementsTotal: reqTotal,
+  };
+}
+
+function firstReflexErrorLine(gate: GateResult): string {
+  const failed = gate.steps.find((s) => !s.passed && !s.skipped);
+  if (!failed) return "";
+  const line = (failed.outputTail ?? "").split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
+  return line ? line.slice(0, 160) : "";
+}
+
+function countReflexDiffLines(diffText: string): number {
+  if (!diffText) return 0;
+  let n = 0;
+  for (const l of diffText.split(/\r?\n/)) {
+    if ((l.startsWith("+") || l.startsWith("-")) && !l.startsWith("++") && !l.startsWith("--")) n++;
+  }
+  return n;
+}
+
+/**
+ * Run the reflex layer over the current iteration's evidence and record the
+ * audit entry. Returns the ReflexResult (or null when disabled).
+ */
+async function runReflex(
+  ctx: ExtensionCommandContext,
+  task: TaskRecord,
+  store: ArtifactStore,
+  config: ReturnType<typeof normalizeConfig>,
+  reflexState: {
+    policy: ReflexPolicy;
+    jev?: JevClient;
+    history: ReflexHistory;
+    iterStates: IterationState[];
+    turnSignals: TurnSignal[];
+  },
+  input: Omit<ReflexRunInput, "policy" | "jev" | "history" | "ctx">,
+): Promise<ReflexResult | null> {
+  if (!config.reflex.enabled) return null;
+  const h = reflexState.history;
+  const prevState = h.states.length > 0 ? h.states[h.states.length - 1] : undefined;
+  const result = await runReflexLayer({
+    policy: reflexState.policy,
+    jev: reflexState.jev,
+    iteration: input.iteration,
+    report: input.report,
+    gate: input.gate,
+    diffText: input.diffText,
+    filesChanged: input.filesChanged,
+    cwd: input.cwd,
+    prevState,
+    state: input.state,
+    turns: input.turns,
+    history: { noProgressStreak: h.noProgressStreak, sameErrorStreak: h.sameErrorStreak },
+    ctx: {
+      retryCount: h.retryCount,
+      maxRetries: config.gate.max_retries,
+      totalIterations: input.iteration,
+    },
+  });
+
+  // Record + persist audit. Observe mode never changes loop behavior; the
+  // result is still logged so we can inspect what reflex WOULD have done.
+  store.write(`reflex-it${input.iteration}.log`, formatReflexResult(result));
+  store.write("reflex-latest.log", formatReflexResult(result));
+  ctx.ui.setStatus("dual-gate-reflex", reflexStatusLabel(result));
+
+  if (config.reflex.mode === "observe") {
+    ctx.ui.notify(`Dual-Gate reflex (observe): ${reflexStatusLabel(result)}`, "info");
+  }
+  return result;
+}
+
+function reflexStatusLabel(r: ReflexResult): string {
+  const loop = r.loop.action;
+  const trend = r.trend;
+  const stuck = r.stuck.verdict;
+  const finish = r.finish?.verdict ?? "-";
+  return `reflex ${loop} · ${trend} · ${stuck} · ${finish}${r.jevConsulted.length ? ` · j:${r.jevConsulted.join(",")}` : ""}`;
+}
+
+// ---------------------------------------------------------------------------
 // Gate
 // ---------------------------------------------------------------------------
 
@@ -2156,6 +2451,16 @@ async function getDiff(cwd: string): Promise<string> {
   const { code: c2, stdout: s2 } = await exec("git", ["diff"], { cwd, timeoutMs: 30_000 });
   if (c2 === 0) return s2;
   return "";
+}
+
+async function gitNameOnly(cwd: string): Promise<string[]> {
+  const { code, stdout } = await exec("git", ["diff", "--name-only", "HEAD"], { cwd, timeoutMs: 30_000 });
+  if (code === 0 && stdout.trim()) {
+    return stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  }
+  const { code: c2, stdout: s2 } = await exec("git", ["diff", "--name-only"], { cwd, timeoutMs: 30_000 });
+  if (c2 === 0) return s2.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -2698,6 +3003,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     { name: "pause", label: "Pause task", description: "Pause the active task (Executor kept alive)" },
     { name: "resume", label: "Resume task", description: "Resume with optional new requirement" },
     { name: "bypass", label: "Bypass next", description: "Next prompt uses normal Pi, then Dual-Gate resumes" },
+    { name: "reflex", label: "Reflex Layer", description: "System-1 reflex: on/off/observe/enforce (Gate/Finish/Stuck/Policy)" },
     { name: "cleanup", label: "Cleanup panes", description: "Close done Dual-Gate worker panes" },
     { name: "help", label: "Help", description: "Show the full command list" },
   ];
@@ -2911,6 +3217,41 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
         case "bypass": {
           rt.manager.setBypassNext(true);
           ctx.ui.notify("Dual-Gate: next prompt will use normal Pi (bypass)", "info");
+          break;
+        }
+        case "reflex": {
+          // Toggle/view the Reflex Layer (System-1).
+          const action = (rest[0] ?? "").toLowerCase();
+          if (action === "on") {
+            rt.config.reflex.enabled = true;
+            saveConfig({ reflex: { ...rt.config.reflex, enabled: true } });
+            ctx.ui.notify("Dual-Gate reflex: ENABLED (mode: " + rt.config.reflex.mode + ")", "success");
+          } else if (action === "off") {
+            rt.config.reflex.enabled = false;
+            saveConfig({ reflex: { ...rt.config.reflex, enabled: false } });
+            ctx.ui.notify("Dual-Gate reflex: disabled", "info");
+          } else if (action === "enforce") {
+            rt.config.reflex.mode = "enforce";
+            saveConfig({ reflex: { ...rt.config.reflex, mode: "enforce" } });
+            ctx.ui.notify("Dual-Gate reflex: mode=enforce (will intervene)", "warning");
+          } else if (action === "observe") {
+            rt.config.reflex.mode = "observe";
+            saveConfig({ reflex: { ...rt.config.reflex, mode: "observe" } });
+            ctx.ui.notify("Dual-Gate reflex: mode=observe (log only)", "info");
+          } else {
+            const r = rt.config.reflex;
+            showText([
+              "Dual-Gate Reflex Layer (System-1)",
+              `  enabled: ${r.enabled}`,
+              `  mode:    ${r.mode}`,
+              `  backend: ${r.backend}`,
+              `  jev deadline: ${r.jev_deadline_ms}ms`,
+              "",
+              "  /dual reflex on|off          enable/disable",
+              "  /dual reflex observe|enforce switch mode",
+              "  reflex artifacts: .pi/dual-gate/<task>/reflex-*.log",
+            ].join("\n"));
+          }
           break;
         }
         case "cleanup": {

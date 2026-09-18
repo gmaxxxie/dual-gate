@@ -108,6 +108,7 @@ Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual product-m
 | `/dual thinking [level]` | thinking: minimal/low/medium/high/xhigh/max |
 | `/dual cancel` | Cancel current task: stop orchestration, keep the pane (renamed `· CANCELLED`), don't delete code or reset git |
 | `/dual bypass` | Next user task goes through normal Pi, then Dual-Gate resumes |
+| `/dual reflex` | Reflex Layer (System-1): `on/off`, `observe/enforce` mode, backend, status |
 | `/dual cleanup` | Close only panes created by Dual-Gate that are DONE/CANCELLED/FAILED (by task ownership) |
 
 ## Configuration (`~/.pi/agent/dual-gate.json`)
@@ -125,9 +126,51 @@ Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual product-m
   "panel": { "direction": "right", "ratio": 0.4, "on_complete": "keep" },
   "worktree": { "mode": "auto" },
   "context": { "send_full_executor_history_to_judge": false },
-  "ui": { "show_widget": true }
+  "ui": { "show_widget": true },
+  "reflex": { "enabled": false, "mode": "observe", "backend": "hybrid", "jev_deadline_ms": 2000 }
 }
 ```
+
+## Reflex Layer (System-1, deterministic + Jev)
+
+A zero-token judgment layer inside the closed loop that decides **whether an
+iteration needs the expensive GPT-5.6 Judge at all**. It runs after the
+executor's report + deterministic gate return, before the Judge:
+
+```
+executor report + gate + diff
+        │
+        ▼
+Reflex: Honest Finish (evidence checklist) + Progress/Stuck + Risk tier
+        │
+        ├─ evidence sufficient (score ≥ 0.8)  → CONTINUE → GPT-5.6 Judge
+        ├─ ambiguous band (0.6–0.8, or flagged) → Jev `goal_met` (~0.5s)
+        │     ├─ Jev confirms  → CONTINUE → Judge
+        │     └─ Jev rejects   → RETRY (same pane, no Judge)
+        ├─ evidence insufficient → RETRY (same pane, no Judge)
+        ├─ unverified claim (said done, never ran gate) → RETRY early
+        └─ STUCK / regression / scope-escape → ESCALATE → Judge / user
+```
+
+**Backends** (`reflex.backend`):
+- `rule` — deterministic heuristics only (zero cost, zero latency)
+- `hybrid` (default) — rule first; Jev (local `jev` CLI, TypeSafe System One,
+  ~0.5s / ~$0.00002 per call) decides the ambiguous band
+- `jev` — Jev first, rule fallback
+
+**Modes**:
+- `observe` (default) — logs `reflex-itN.log` + status, **never intervenes**
+- `enforce` — RETRY/ESCALATE actually steer the loop (skip Judge on RETRY)
+
+**Commands**: `/dual reflex on|off`, `/dual reflex observe|enforce`,
+`/dual reflex` (status). Artifacts: `.pi/dual-gate/<task>/reflex-itN.log`,
+`reflex-latest.log`, `reflex-history.json`.
+
+**Design**: Jev is System-1 — it never generates text, only probabilities,
+and cannot speed up a single GPT-5.6 reasoning pass. Its value is **diverting
+ordinary judgments to 0.5s so GPT-5.6 Judge calls (seconds–tens of seconds)
+happen only when the Reflex genuinely cannot decide**. GPT-5.6 remains the
+System-2 authority and is never removed from the loop.
 
 ## When to enable Dual-Gate
 
@@ -231,9 +274,12 @@ Also: DIAGNOSING (iteration threshold → Convergence Diagnosis), WAITING_PERMIS
 ```bash
 cd /path/to/dual-gate
 node --experimental-strip-types tests/core.test.ts   # core assertions
+node --experimental-strip-types tests/reflex.test.ts # reflex layer (18 tests)
 ```
 
 Covers: config defaults/normalization/invalid values, task id/title/agent name, state machine transitions, convergence tracking, risk detection, YAML/Execution Report/Judge parsing (converged/implementation_gap/spec_gap/blocked), contract/spec-revision/diagnosis parsing, prompt building (initial/delta-fix/judge), artifact store, gate discovery (node/python/go/no command), gate running (pass/fail), project WBS parsing/validation/stable topological ordering, milestone→contract projection, PM launch policy and plan/feedback/acceptance IPC correlation, project lifecycle/cancellation/acceptance guards.
+
+`tests/reflex.test.ts` covers: risk-tier classification (LOW→CRITICAL), test-weakening/stub/scope-escape detection, Honest Finish evidence checklist + boundary cases, quantified progress comparison (8→5→2 = PROGRESS), stuck decision (oscillation/repeated-error/no-progress), escalation policy mapping (CONTINUE/RETRY/RETRY_WITH_HINT/ESCALATE), policy normalization/merge, Jev ambiguous-band flow (rule-only / Jev-reject / Jev-confirm).
 
 ## End-to-End Verification (real runs)
 
