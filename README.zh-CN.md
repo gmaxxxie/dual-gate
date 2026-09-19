@@ -108,6 +108,7 @@ cp -r extension ~/.pi/agent/extensions/dual-gate/
 | `/dual thinking [level]` | thinking: minimal/low/medium/high/xhigh/max |
 | `/dual cancel` | 取消当前任务：停止编排、保留 pane（重命名 `· CANCELLED`）、不删代码不 reset git |
 | `/dual bypass` | 下一条用户任务走普通 Pi，之后恢复 Dual-Gate |
+| `/dual sandbox [on\|off\|status]` | Executor 沙箱（Tier-2）：`on/off`、`backend <auto\|sbx\|docker>`、`scope <task\|repo>`、`require <on\|off>` |
 | `/dual cleanup` | 只关闭 Dual-Gate 创建的、已 DONE/CANCELLED/FAILED 的 pane（按 task ownership） |
 
 ## 配置（`~/.pi/agent/dual-gate.json`）
@@ -117,9 +118,10 @@ cp -r extension ~/.pi/agent/extensions/dual-gate/
   "enabled": false,   // 默认关闭；/dual on 后持久化为 true
   "controller": { "model": "openai-codex/gpt-5.6-sol", "thinking": "medium" },
   "executor": { "model": "new-api/deepseek-v4-flash" },
+  "sandbox": { "enabled": false, "backend": "auto", "extension_path": "", "scope": "task", "keepalive": true, "docker_image": "debian:stable-slim", "require": false },
   "product_manager": { "model": "default" },
   "runtime": { "herdr": "required" },
-  "gate": { "enabled": true, "max_retries": 3, "timeoutMs": 300000 },
+  "gate": { "enabled": true, "max_retries": 3, "timeoutMs": 300000, "execution": "auto" },
   "judge": { "max_retries": 2 },
   "loop": { "max_iterations": 5 },
   "panel": { "direction": "right", "ratio": 0.4, "on_complete": "keep" },
@@ -128,6 +130,68 @@ cp -r extension ~/.pi/agent/extensions/dual-gate/
   "ui": { "show_widget": true }
 }
 ```
+
+## Executor 沙箱（Tier-2 隔离，可选）
+
+默认情况下 Executor pane 的 `pi` 以完整用户权限跑在宿主机上：它改仓库，它跑的测试就是在执行仓库代码。可选的 Executor 沙箱把 Executor 的**内置工具**（`bash`、`read`、`write`、`edit`、`grep`、`find`、`ls`）路由进一个一次性的 Docker Sandbox（`sbx`）microVM，而 `pi` 本身仍留在宿主机（自己的 auth、config、session、模型 key）。workspace 按宿主机绝对路径挂载，因此 worktree/合并流程不变。
+
+```
+Executor pane（cwd = 任务 worktree/仓库）
+  └─ pi            （宿主机：auth、模型、session）
+       └─ bash/read/write/edit/grep/find/ls ──► sbx microVM（自带 docker daemon）
+```
+
+只隔离 **Executor，以及（默认）Gate**，Controller 与 Judge 不变。有两点必须提前知道：
+
+- **Gate 在 Executor 自己的容器里跑**（`gate.execution: auto`），所以 Executor 侧通过的结果不会再因为沙箱↔宿主机漂移而被 Gate 判失败——Gate 看到的就是干活时的那个环境。每个 gate 结果都会记录它在哪跑的（`Gate environment: docker:<container>` 或 `host`），证据是显式的而不是假定的。`gate.execution: host` 恢复旧行为；`sandbox` 在无容器时 fail closed。
+- **默认按任务隔离**（`scope: task`）：Task A 拉取的镜像和容器不会污染 Task B，并行里程碑的不同 worktree 也绝不会共用同一个沙箱挂载。
+
+沙箱开启时，Executor pane 在**任务 cwd** 切分（而非通常的稳定 pane cwd）——pi-docker-sandbox 挂载的是 pane 进程的 cwd，从 `$HOME` 启动会把整个家目录挂进去。若该 cwd 挂不住 pane（见「已知环境事实」），Dual-Gate 会退回稳定 cwd 并**关闭沙箱**，而不是让任务失败；`sandbox.require: true` 则改为失败。沙箱关闭时切分行为与原来完全一致。
+
+### 依赖
+
+需要 pi-docker-sandbox 的 `sandbox/` 执行后端，以及一个可路由的运行环境：
+
+| 后端 | 要求 |
+|---|---|
+| `sbx`（优先） | `sbx` CLI + 宿主 hypervisor（Linux x86_64 需 KVM，用户在 `kvm` 组）+ `sbx login` |
+| `docker` | 可用的 `docker` CLI——Dual-Gate 会自己创建并持有每任务一个容器。用 `SBX_DOCKER_CONTAINER` 指定则改用你自己的容器。不需要 sbx，也不需要 KVM。 |
+
+> `sbx` 官方**仅支持 Ubuntu 24.04+**（Docker 的 apt 仓库没有 Debian 包，且 `sbx login` 需要交互式浏览器 OAuth）。其他发行版实际可行的路径是 docker 后端。
+
+### 容器生命周期（docker 后端）
+
+pi-docker-sandbox 的 docker 后端从不管理自己的目标——按设计由调用方提供。因此当沙箱回退到 docker 时，**容器由 Dual-Gate 自己持有**：
+
+- **每任务一个容器**，命名 `dg-sbx-<taskId>`，带标签 `com.dual-gate.sandbox=true`，项目按宿主机绝对路径挂载。因此并行里程碑的不同 worktree 绝不会共用挂载。
+- **在创建 pane 之前创建**；已存在则复用（启动它），所以恢复流程能接上。创建失败则 Executor 带警告回退宿主机（`require: true` 改为让 spawn 失败）。
+- **任务进入终态时释放**（DONE/FAILED/CANCELLED/ESCALATED），`/dual cleanup` 也会释放。`/dual cleanup` 和会话启动还会清扫崩溃/强杀遗留的孤儿容器。
+- 只处理带 Dual-Gate 标签的容器，**你自己的容器永远不会被删**。
+- 镜像由 `sandbox.docker_image` 决定；留空则按项目语言推导（`node:22-slim`、`python:3.12-slim`、`golang:1.23-bookworm`、`rust:1-slim-bookworm`，否则 `debian:stable-slim`），这样工具链就在容器里，不需要 Executor 每个任务重装一遍——Gate 也才能在里面跑。
+
+后端要装**在每个你想用沙箱的项目里**（推荐）。把 `extensions` 过滤为空可让它那 19 个 `docker_*` 工具不进入 Controller 的 prompt——实际只需要文件在盘上。Dual-Gate 在**目标仓库**里找后端，所以没装的项目会带警告 fail-open 回退到宿主机（`/dual sandbox` 里可见）。
+
+```bash
+pi install -l npm:@stixxert/pi-docker-sandbox
+```
+
+```jsonc
+// .pi/settings.json —— 文件装到盘上，但 Controller 不注册任何工具
+{ "packages": [ { "source": "npm:@stixxert/pi-docker-sandbox", "extensions": [] } ] }
+```
+
+### 启用
+
+```bash
+/dual sandbox on                       # 启用（默认关闭）
+/dual sandbox                          # 状态：后端、可用性、解析到的路径、scope
+/dual sandbox backend sbx|docker|auto  # auto = 优先 sbx，否则用已指定的容器
+/dual sandbox scope task|repo          # task = 按任务隔离；repo = 热复用（共享）
+/dual sandbox require on|off           # 默认 off = 不可用时回退到宿主机
+/dual sandbox gate auto|host|sandbox   # Gate 在哪跑（默认 auto = Executor 的容器）
+```
+
+**默认 fail-open。** 后端缺失或不可用时，Dual-Gate 会警告，Executor 跑在**宿主机**上：一个没法沙箱化的任务仍然值得跑。设 `require: true` 则改为让 spawn 失败。警告之所以写得明确，是因为「静默地没进沙箱」才是危险的那种情况。
 
 ## 何时启动 Dual-Gate
 
@@ -221,10 +285,10 @@ IDLE → PLANNING → SPAWNING_EXECUTOR → EXECUTING → GATING
 
 ## 已知环境事实（本机验证）
 
-- `herdr pane split --cwd <git-repo>` 的 pane 会被回收（shell 检测失败），故 **split 始终用主 pane cwd**，Executor 通过 prompt 里的 REPOSITORY 路径自行 cd。
+- `herdr pane split --cwd <git-repo>` 的 pane **可能**被瞬时回收（SIGHUP），而且是否被回收取决于仓库**在哪里**，不取决于它是不是仓库。在当前 Herdr 版本上实测（每个重复多次）：`~/Project` 下的 git checkout 存活；`/tmp`、`/var/tmp`、或 `$HOME` 直接子目录下的 git checkout 约 1 秒内被回收；非 git 目录在任何位置都存活。所以旧记录在实质上是**对的**。Dual-Gate 默认仍用主 pane cwd 切分（行为不变），仅当 Executor 沙箱开启时才用任务 cwd（挂载要求）；若该 cwd 挂不住 pane，会退回稳定 cwd 并**关闭沙箱**，而不是让任务失败。
 - `agent prompt --wait` 对快速完成的回复会误报 `agent_prompt_stalled`——实际消息已处理；扩展用**轮询 `agent get` 到 idle/done**。
 - `pi -p`（print 模式）在异步 execFile 下可能 SIGTERM（需同步调用）；扩展内推理走 `modelRegistry.complete`（进程内），不受影响。
-- 主 pane cwd 的 split 稳定（连续 5/5 存活），git repo cwd 的 split 稳定回收（0/5 存活）。
+- 主 pane cwd 的 split 稳定。repo cwd 的 split 是**位置相关**的（见上），所以沙箱路径带了一个「无沙箱回退」。
 
 ## 测试
 

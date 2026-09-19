@@ -33,6 +33,8 @@ import {
   normalizeConfig,
   isThinking,
   resolveModelString,
+  resolveExecutorModel,
+  discoverProviderExtensions,
   findAvailableAuthenticatedModel,
   taskDirFor,
   projectDirFor,
@@ -87,12 +89,24 @@ import {
   type ConvergenceDiagnosis,
 } from "./core.ts";
 import type { ProjectPlan, ProjectRecord, ProjectMilestoneContext, ProductManagerRecord, ProjectMilestoneFeedback } from "./types.ts";
-import { discoverGateCommands, runGate, formatGateResult, skippedGateResult, type GateResult } from "./gate.ts";
+import { discoverGateCommands, runGate, formatGateResult, skippedGateResult, detectProjectLanguage, type GateResult, type GateExec, type GateDiscovery } from "./gate.ts";
 import { runReflexLayer, makeJevClient, formatReflexResult, type JevClient, type ReflexRunInput, type ReflexResult } from "./reflex/index.ts";
 import { JevBackend } from "./reflex/backend.ts";
 import { runTriage, logTriage, TRIAGE_LOG_FILE, type TriageDecision } from "./triage.ts";
 import { normalizeReflexPolicy, type ReflexPolicy, type IterationState, type TurnSignal, type LoopAction } from "./reflex/types.ts";
 import { pushWindow } from "./reflex/progress.ts";
+import {
+  planExecutorSandbox,
+  sandboxExecutorArgs,
+  sandboxContainerNameFor,
+  dockerRunArgs,
+  dockerExecArgs,
+  resolveDockerImage,
+  projectGateContainerNameFor,
+  SANDBOX_CONTAINER_LABEL,
+  formatSandboxStatus,
+  type SandboxPlan,
+} from "./sandbox.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -358,6 +372,12 @@ function saveConfig(patch: Partial<ReturnType<typeof normalizeConfig>>): void {
         ...(patch.reflex as Partial<typeof base.reflex>),
       } as typeof base.reflex;
     }
+    if (patch.sandbox && typeof patch.sandbox === "object") {
+      merged.sandbox = {
+        ...(base.sandbox ?? {}),
+        ...(patch.sandbox as Partial<typeof base.sandbox>),
+      } as typeof base.sandbox;
+    }
 
     // Atomic write: write temp file then rename, so a crash mid-write can't
     // corrupt the persisted config.
@@ -451,7 +471,7 @@ function productManagerPiArgs(model: string): string[] {
   return buildProductManagerPiArgs(model, PM_WRITE_GUARD_EXTENSION_PATH, PM_SEARCH_EXTENSION_PATH);
 }
 
-function executorPiArgs(model: string): string[] {
+function executorPiArgs(model: string, sandboxArgs: string[] = [], extraExtensions: string[] = []): string[] {
   // Keep all user extensions disabled to prevent recursive Dual-Gate tasks,
   // but explicitly retain Herdr's Pi state reporter so worker lifecycle can
   // be observed reliably. An empty model means "use the parent Pi's current
@@ -463,7 +483,204 @@ function executorPiArgs(model: string): string[] {
   if (existsSync(HERDR_PI_STATE_EXTENSION_PATH)) {
     args.push("--extension", HERDR_PI_STATE_EXTENSION_PATH);
   }
+  // Provider extensions: `--no-extensions` hides them, but the worker still
+  // needs whichever provider owns its model (e.g. new-api/*).
+  for (const ext of extraExtensions) args.push("--extension", ext);
+  // Tier-2 isolation: load pi-docker-sandbox's execution backend, which
+  // overrides the built-in tools so they execute inside the sandbox microVM.
+  args.push(...sandboxArgs);
   return args;
+}
+
+/** `pi` args that load the sandbox backend; empty when the sandbox is off. */
+function sandboxArgsFor(plan: SandboxPlan): string[] {
+  return plan.enabled && plan.extensionPath ? sandboxExecutorArgs(plan.extensionPath) : [];
+}
+
+/**
+ * Extensions the Executor pane must load explicitly.
+ *
+ * The pane runs with `--no-extensions` so a worker Dual-Gate can never
+ * recursively intercept its own prompt. That also hides provider extensions —
+ * and without its provider, `executor.model: "default"` cannot resolve to the
+ * main Pi's model and silently falls back to a built-in one. Discover the
+ * installed `pi-provider-*` packages and add any user-configured extras.
+ */
+let providerExtensionCache: string[] | null = null;
+function workerProviderExtensions(repoPath: string, config: ReturnType<typeof normalizeConfig>): string[] {
+  if (providerExtensionCache === null) {
+    providerExtensionCache = discoverProviderExtensions([
+      join(homedir(), ".pi", "agent", "npm", "node_modules"),
+      join(repoPath, ".pi", "npm", "node_modules"),
+      join(repoPath, "node_modules"),
+    ]);
+  }
+  return [...new Set([...providerExtensionCache, ...config.executor.extra_extensions])];
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox container lifecycle (docker backend)
+//
+// pi-docker-sandbox's docker backend never manages its target — it is
+// caller-supplied by design. When the sbx microVM is unavailable, Dual-Gate
+// therefore owns a per-task container itself: one container per task (so
+// parallel milestones never share a mount), labelled so cleanup can never
+// touch containers it does not own. The name is derived from the task id, so
+// recovery and cleanup need no persisted state.
+// ---------------------------------------------------------------------------
+
+/** Is the named container present and running? */
+async function containerRunning(name: string): Promise<boolean> {
+  const r = await exec("docker", ["container", "inspect", "-f", "{{.State.Running}}", name], { timeoutMs: 20_000 });
+  return r.code === 0 && r.stdout.trim() === "true";
+}
+
+/** Create (or reuse) a labelled sandbox container. Idempotent. */
+async function ensureSandboxContainer(
+  name: string,
+  repoPath: string,
+  image: string,
+  ownerId: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (await containerRunning(name)) return { ok: true };
+
+  // Present but stopped? Start it rather than recreating (keeps its state).
+  const inspect = await exec("docker", ["container", "inspect", "-f", "{{.State.Status}}", name], { timeoutMs: 20_000 });
+  if (inspect.code === 0) {
+    const started = await exec("docker", ["start", name], { timeoutMs: 60_000 });
+    if (started.code !== 0) return { ok: false, error: `docker start ${name} failed: ${started.stderr || started.stdout}` };
+    return { ok: true };
+  }
+
+  // Mount the task's worktree/repo at its host absolute path — that identity is
+  // what pi-docker-sandbox's docker backend relies on.
+  const run = await exec("docker", dockerRunArgs({ name, repoPath, image, taskId: ownerId }), { timeoutMs: 180_000 });
+  if (run.code !== 0) {
+    return { ok: false, error: `docker run ${name} failed: ${(run.stderr || run.stdout).trim().slice(0, 300)}` };
+  }
+  return { ok: true };
+}
+
+/**
+ * Gate transport for a task.
+ *
+ * Running the gate inside the Executor's own container is the whole point of
+ * Tier-1: the gate then sees exactly the environment the Executor worked in,
+ * so sandbox↔host drift can no longer make an Executor-side pass fail the
+ * gate. Returns no transport (→ host) when the sandbox is off, unavailable, or
+ * its container is gone; `gate.execution = "sandbox"` turns that into an error
+ * instead of a silent downgrade.
+ */
+async function gateExecForTask(
+  task: TaskRecord,
+  config: ReturnType<typeof normalizeConfig>,
+): Promise<{ exec?: GateExec; environment: string; error?: string }> {
+  if (config.gate.execution === "host") return { environment: "host" };
+  if (!config.sandbox.enabled) return { environment: "host" };
+
+  const language = detectProjectLanguage(task.repoPath);
+  const plan = planExecutorSandbox({ repoPath: task.repoPath, taskId: task.taskId, config: config.sandbox, language });
+  const container = plan.enabled && plan.availability.backend === "docker"
+    ? (plan.managedContainer ? plan.container : plan.availability.container)
+    : undefined;
+
+  if (!container || !(await containerRunning(container))) {
+    const why = !plan.enabled
+      ? (plan.warning ?? "the sandbox is not active for this task")
+      : plan.availability.backend === "sbx"
+        ? "the sbx backend does not support gate execution yet"
+        : `sandbox container ${container ?? "(none)"} is not running`;
+    if (config.gate.execution === "sandbox") return { environment: "unavailable", error: `gate.execution=sandbox but ${why}` };
+    return { environment: "host" };
+  }
+
+  const gateExec: GateExec = async (cwd, argv, opts) => {
+    const r = await exec("docker", dockerExecArgs({ container, cwd, argv }), { timeoutMs: opts.timeoutMs });
+    return { code: r.code, stdout: r.stdout, stderr: r.stderr };
+  };
+  return { exec: gateExec, environment: `docker:${container}` };
+}
+
+/** A failed gate that never ran, used when gate.execution=sandbox is unmet. */
+function unavailableGateResult(reason: string): GateResult {
+  return {
+    passed: false,
+    environment: "unavailable",
+    steps: [{ name: "gate:sandbox", command: "(not run)", passed: false, skipped: false, exitCode: null, outputTail: reason, durationMs: 0 }],
+  };
+}
+
+/**
+ * Final project gate. Runs in a dedicated sandbox container when the sandbox
+ * is on, so final acceptance is verified in the same environment the
+ * milestones were built in. The container is removed afterwards.
+ */
+async function runProjectFinalGate(
+  project: ProjectRecord,
+  config: ReturnType<typeof normalizeConfig>,
+  discovery: GateDiscovery,
+): Promise<GateResult> {
+  const container = config.sandbox.enabled && config.gate.execution !== "host"
+    ? projectGateContainerNameFor(project.projectId)
+    : undefined;
+  if (!container) {
+    return runGate(project.repoPath, discovery, { timeoutMs: config.gate.timeoutMs, environment: "host" });
+  }
+
+  const image = resolveDockerImage(config.sandbox.docker_image, detectProjectLanguage(project.repoPath));
+  const ensured = await ensureSandboxContainer(container, project.repoPath, image, `project:${project.projectId}`);
+  if (!ensured.ok) {
+    const why = ensured.error ?? "sandbox container unavailable";
+    if (config.gate.execution === "sandbox") return unavailableGateResult(`gate.execution=sandbox but ${why}`);
+    return runGate(project.repoPath, discovery, { timeoutMs: config.gate.timeoutMs, environment: "host" });
+  }
+
+  try {
+    const gateExec: GateExec = async (cwd, argv, opts) => {
+      const r = await exec("docker", dockerExecArgs({ container, cwd, argv }), { timeoutMs: opts.timeoutMs });
+      return { code: r.code, stdout: r.stdout, stderr: r.stderr };
+    };
+    return await runGate(project.repoPath, discovery, {
+      timeoutMs: config.gate.timeoutMs,
+      exec: gateExec,
+      environment: `docker:${container}`,
+    });
+  } finally {
+    await exec("docker", ["rm", "-f", container], { timeoutMs: 60_000 });
+  }
+}
+
+/** Release a task's sandbox container as soon as the task reaches a terminal state. */
+function bindSandboxLifecycle(manager: TaskManager): void {
+  manager.onTerminal = (taskId) => { void releaseSandboxContainer(taskId); };
+}
+
+/** Remove a task's sandbox container. Best-effort: never throws. */
+async function releaseSandboxContainer(taskId: string): Promise<void> {
+  const name = sandboxContainerNameFor(taskId);
+  if (!name) return;
+  await exec("docker", ["rm", "-f", name], { timeoutMs: 60_000 });
+}
+
+/**
+ * Remove every Dual-Gate-owned sandbox container whose task is NOT in
+ * `keepTaskIds`. This is how orphans from a crash or hard kill get reclaimed
+ * without ever touching a container Dual-Gate does not own.
+ */
+async function gcSandboxContainers(keepTaskIds: string[]): Promise<number> {
+  const keep = new Set(keepTaskIds.map((id) => sandboxContainerNameFor(id)).filter((n): n is string => !!n));
+  const list = await exec("docker", ["ps", "-aq", "--filter", `label=${SANDBOX_CONTAINER_LABEL}=true`], { timeoutMs: 30_000 });
+  if (list.code !== 0) return 0;
+  let removed = 0;
+  for (const id of list.stdout.split("\n").map((s) => s.trim()).filter(Boolean)) {
+    const inspect = await exec("docker", ["container", "inspect", "-f", `{{index .Config.Labels "${SANDBOX_CONTAINER_LABEL}.task"}}`, id], { timeoutMs: 20_000 });
+    if (inspect.code !== 0) continue;
+    const name = sandboxContainerNameFor(inspect.stdout.trim());
+    if (name && keep.has(name)) continue;
+    const rm = await exec("docker", ["rm", "-f", id], { timeoutMs: 60_000 });
+    if (rm.code === 0) removed++;
+  }
+  return removed;
 }
 
 async function herdrAgentStart(opts: { name: string; kind: string; pane: string; timeoutMs?: number; args?: string[] }): Promise<void> {
@@ -1679,14 +1896,73 @@ async function orchestrate(ctx: ExtensionCommandContext, task: TaskRecord, optio
 // Spawn executor in a Herdr pane
 // ---------------------------------------------------------------------------
 
+/**
+ * Split the Executor pane.
+ *
+ * With the sandbox ON the pane must start in the task cwd, because that is the
+ * directory pi-docker-sandbox mounts. But some cwds make Herdr reap a pane
+ * immediately (observed as SIGHUP: a git checkout outside the usual project
+ * root — /tmp, /var/tmp, a direct child of $HOME all reproduce it), so if the
+ * task cwd cannot hold a pane we retry from the stable cwd WITHOUT the sandbox
+ * instead of failing the task.
+ *
+ * The fallback deliberately drops the sandbox entirely: starting in $HOME with
+ * the sandbox on would mount the whole home directory into the microVM.
+ */
+async function splitExecutorPane(
+  ctx: ExtensionCommandContext,
+  config: ReturnType<typeof normalizeConfig>,
+  sandbox: SandboxPlan,
+  taskCwd: string,
+): Promise<{ paneId: string; sandboxActive: boolean } | null> {
+  const plans: Array<{ cwd: string; env?: Record<string, string>; sandbox: boolean }> = [];
+  if (sandbox.enabled) plans.push({ cwd: taskCwd, env: sandbox.env, sandbox: true });
+  plans.push({ cwd: stableHerdrPaneCwd(), sandbox: false });
+
+  for (const plan of plans) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const candidate = await herdrPaneSplit({
+        direction: config.panel.direction,
+        cwd: plan.cwd,
+        noFocus: true,
+        ratio: config.panel.ratio,
+        env: plan.env,
+      });
+      // Pane may be recycled instantly if its shell did not come up; verify.
+      await sleep(1500);
+      if (await herdrPaneExists(candidate)) return { paneId: candidate, sandboxActive: plan.sandbox };
+      ctx.ui.notify(`Dual-Gate: pane ${candidate} recycled — retrying (${attempt}/3)`, "warning");
+    }
+    if (plan.sandbox) {
+      ctx.ui.notify(
+        `Dual-Gate: ${taskCwd} cannot hold a Herdr pane — retrying without the sandbox (Executor will run on the HOST)`,
+        "warning",
+      );
+    }
+  }
+  return null;
+}
+
 async function spawnExecutor(ctx: ExtensionCommandContext, task: TaskRecord, config: ReturnType<typeof normalizeConfig>, projectContext?: ProjectMilestoneContext): Promise<void> {
   const rt = getRuntime();
   const registry = makeRegistry(ctx);
   const configured = config.executor.model;
-  // Executor=default means the worker follows the parent Pi's current model:
-  // omit the --model flag when launching so pi uses its own default.
-  const executorLabel = configured === "default" ? "default（跟随主 Pi）" : (registry.find(configured)?.id ?? configured);
-  const executorModel = configured === "default" ? "default" : configured;
+  // Executor=default means the worker follows the main Pi's current model.
+  // Resolve it to a concrete id: a Herdr child does NOT inherit Pi's --model
+  // selection, so omitting the flag would silently run a different model.
+  const resolved = resolveExecutorModel(configured, ctx.model);
+  const executorModel = resolved.model;
+  const executorLabel = registry.find(executorModel)?.id ?? resolved.label;
+  if (resolved.unresolved) {
+    ctx.ui.notify(
+      "Dual-Gate: cannot resolve the main Pi model for Executor=default — the worker will use its own default",
+      "warning",
+    );
+  } else if (configured === "default") {
+    // Record the concrete model so status, artifacts and the Judge prompt name
+    // the model that actually executed.
+    rt.manager.patch(task.taskId, { executorModel });
+  }
 
   // Preflight: dual-gate needs to run INSIDE a Herdr pane to split a new
   // executor pane. Outside Herdr this fails with a bare CLI error; give the
@@ -1711,26 +1987,59 @@ async function spawnExecutor(ctx: ExtensionCommandContext, task: TaskRecord, con
   const panelTitle = derivePanelTitle(task.taskId, basename(task.repoPath), task.originalRequest);
   const agentName = deriveAgentName(task.taskId);
 
-  try {
-    // 1. Split from a stable non-repository cwd. Herdr can recycle panes whose
-    //    shell starts in a Git checkout; the Executor receives the real
-    //    REPOSITORY path in its prompt and changes there itself.
-    //    --ratio: worker pane takes ~40% width by default (config.panel.ratio).
-    const splitCwd = stableHerdrPaneCwd();
-    let paneId: string | null = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      const candidate = await herdrPaneSplit({ direction: config.panel.direction, cwd: splitCwd, noFocus: true, ratio: config.panel.ratio });
-      // Pane may be recycled instantly if its shell did not come up; verify.
-      await sleep(1500);
-      if (await herdrPaneExists(candidate)) {
-        paneId = candidate;
-        break;
+  // Tier-2: resolve the Executor sandbox BEFORE creating the pane. A fatal plan
+  // (sandbox.require) stops the spawn; otherwise we fail open to the host and
+  // say so loudly, because "silently unsandboxed" is the dangerous case.
+  const sandbox = planExecutorSandbox({
+    repoPath: task.repoPath,
+    taskId: task.taskId,
+    config: config.sandbox,
+    language: detectProjectLanguage(task.repoPath),
+  });
+  if (sandbox.fatal) {
+    rt.manager.patch(task.taskId, { state: "FAILED", currentStage: "failed", error: sandbox.fatal });
+    writeState(task, makeStore(task));
+    ctx.ui.notify(`Dual-Gate: ${sandbox.fatal}`, "error");
+    return;
+  }
+  if (sandbox.warning) ctx.ui.notify(`Dual-Gate: ${sandbox.warning}`, "warning");
+  else if (sandbox.enabled) ctx.ui.notify(`Dual-Gate: Executor sandbox ON — ${sandbox.availability.detail}`, "info");
+
+  // Docker backend: Dual-Gate owns the container, so it must exist before the
+  // pane is created — otherwise the pane would exec into nothing.
+  if (sandbox.enabled && sandbox.managedContainer) {
+    const ensured = await ensureSandboxContainer(sandbox.container!, cwd, sandbox.dockerImage, task.taskId);
+    if (!ensured.ok) {
+      const detail = ensured.error ?? "sandbox container unavailable";
+      if (config.sandbox.require) {
+        rt.manager.patch(task.taskId, { state: "FAILED", currentStage: "failed", error: detail });
+        writeState(task, makeStore(task));
+        ctx.ui.notify(`Dual-Gate: ${detail}`, "error");
+        return;
       }
-      ctx.ui.notify(`Dual-Gate: pane ${candidate} recycled — retrying (${attempt}/3)`, "warning");
+      ctx.ui.notify(`Dual-Gate: ${detail} — Executor will run on the HOST`, "warning");
+      sandbox.enabled = false;
     }
-    if (!paneId) {
+  }
+
+  try {
+    // 1. Split the executor pane. When the sandbox is enabled the pane must
+    //    start in the task worktree/repo: pi-docker-sandbox mounts the pane's
+    //    cwd into the microVM, so starting in $HOME would mount all of it.
+    //    If that cwd cannot hold a pane, fall back to the stable cwd without
+    //    the sandbox rather than failing the task outright.
+    const split = await splitExecutorPane(ctx, config, sandbox, cwd);
+    if (!split) {
       throw new Error("failed to create a persistent executor pane after 3 attempts");
     }
+    if (sandbox.enabled && !split.sandboxActive) {
+      if (config.sandbox.require) {
+        throw new Error(`sandbox required but ${cwd} cannot hold a Herdr pane for the workspace mount`);
+      }
+      sandbox.enabled = false;
+      ctx.ui.notify("Dual-Gate: sandbox disabled for this task — Executor will run on the HOST", "warning");
+    }
+    const paneId: string = split.paneId;
     rt.manager.patch(task.taskId, { herdrPanelId: paneId, currentStage: "spawned" });
 
     // 2. Rename the pane
@@ -1746,7 +2055,7 @@ async function spawnExecutor(ctx: ExtensionCommandContext, task: TaskRecord, con
       kind: "pi",
       pane: paneId,
       timeoutMs: 180_000,
-      args: executorPiArgs(executorModel),
+      args: executorPiArgs(executorModel, sandboxArgsFor(sandbox), workerProviderExtensions(task.repoPath, config)),
     });
     rt.manager.patch(task.taskId, { herdrAgentName: agentName, panelCreated: true });
 
@@ -1797,7 +2106,13 @@ async function recoverExecutor(
   const rt = getRuntime();
   const registry = makeRegistry(ctx);
   const configured = config.executor.model;
-  const executorModel = configured === "default" ? "default" : configured;
+  // Same rule as spawnExecutor: resolve `default` to the main Pi's model
+  // rather than omitting --model and silently using the worker's own default.
+  const resolved = resolveExecutorModel(configured, ctx.model);
+  const executorModel = resolved.model;
+  if (resolved.unresolved) {
+    ctx.ui.notify("Dual-Gate: cannot resolve the main Pi model for Executor=default — the worker will use its own default", "warning");
+  }
 
   try {
     // Old pane may still exist but be unusable; try to close it, ignore errors.
@@ -1810,27 +2125,35 @@ async function recoverExecutor(
     const panelTitle = `${baseTitle} · recovered`;
     const agentName = (deriveAgentName(task.taskId) + "-r").slice(0, 31);
 
-    const splitCwd = stableHerdrPaneCwd();
-    let paneId: string | null = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      const candidate = await herdrPaneSplit({ direction: config.panel.direction, cwd: splitCwd, noFocus: true, ratio: config.panel.ratio });
-      await sleep(1500);
-      if (await herdrPaneExists(candidate)) {
-        paneId = candidate;
-        break;
+    // Recovery must land in the same isolation mode as the original spawn.
+    const sandbox = planExecutorSandbox({
+      repoPath: task.repoPath,
+      taskId: task.taskId,
+      config: config.sandbox,
+      language: detectProjectLanguage(task.repoPath),
+    });
+    if (sandbox.warning) ctx.ui.notify(`Dual-Gate: ${sandbox.warning}`, "warning");
+    if (sandbox.enabled && sandbox.managedContainer) {
+      const ensured = await ensureSandboxContainer(sandbox.container!, cwd, sandbox.dockerImage, task.taskId);
+      if (!ensured.ok) {
+        ctx.ui.notify(`Dual-Gate: ${ensured.error ?? "container unavailable"} — recovery will run on the HOST`, "warning");
+        sandbox.enabled = false;
       }
-      ctx.ui.notify(`Dual-Gate: recovery pane ${candidate} recycled — retrying (${attempt}/3)`, "warning");
     }
-    if (!paneId) {
+
+    const split = await splitExecutorPane(ctx, config, sandbox, cwd);
+    if (!split) {
       throw new Error("failed to create a persistent recovery pane after 3 attempts");
     }
+    const paneId: string = split.paneId;
+    if (sandbox.enabled && !split.sandboxActive) sandbox.enabled = false;
     await exec("herdr", ["pane", "rename", paneId, panelTitle], { timeoutMs: 15_000 });
     await herdrAgentStart({
       name: agentName,
       kind: "pi",
       pane: paneId,
       timeoutMs: 180_000,
-      args: executorPiArgs(executorModel),
+      args: executorPiArgs(executorModel, sandboxArgsFor(sandbox), workerProviderExtensions(task.repoPath, config)),
     });
     rt.manager.patch(task.taskId, { herdrPanelId: paneId, herdrAgentName: agentName, panelCreated: true });
 
@@ -2300,7 +2623,19 @@ async function runDeterministicGate(
   }
   const discovery = discoverGateCommands(cwd);
   store.write("gate-discovery.json", { commands: discovery.commands, notes: discovery.notes });
-  const result = await runGate(cwd, discovery, { timeoutMs: config.gate.timeoutMs });
+  // Tier-1: run the gate in the Executor's own sandbox container so the gate
+  // sees exactly the environment the Executor worked in (no sandbox↔host drift).
+  const target = await gateExecForTask(task, config);
+  if (target.error) {
+    const result = unavailableGateResult(target.error);
+    store.write("gate.log", formatGateResult(result));
+    return result;
+  }
+  const result = await runGate(cwd, discovery, {
+    timeoutMs: config.gate.timeoutMs,
+    exec: target.exec,
+    environment: target.environment,
+  });
   store.write("gate.log", formatGateResult(result) + "\n" + result.steps.map((s) => `--- ${s.command} ---\n${s.outputTail}`).join("\n"));
   return result;
 }
@@ -2862,7 +3197,7 @@ async function runProject(ctx: ExtensionCommandContext, request: string, repoOve
     const finalStore = createArtifactStore(project.artifactDir);
     const discovery = config.gate.enabled ? discoverGateCommands(project.repoPath) : { commands: [], notes: ["Deterministic gate disabled by configuration."] };
     finalStore.write("final-gate-discovery.json", { commands: discovery.commands, notes: discovery.notes });
-    const finalGate = config.gate.enabled ? await runGate(project.repoPath, discovery, { timeoutMs: config.gate.timeoutMs }) : skippedGateResult("Deterministic gate disabled by configuration.");
+    const finalGate = config.gate.enabled ? await runProjectFinalGate(project, config, discovery) : skippedGateResult("Deterministic gate disabled by configuration.");
     if (isProjectFinalizationStopped(project.status, rt.stopRequested)) return;
     finalStore.write("final-gate.log", formatGateResult(finalGate));
     const diff = await getDiff(project.repoPath);
@@ -2926,9 +3261,11 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
   };
 
   const rt = getRuntime();
+  bindSandboxLifecycle(rt.manager);
 
   pi.on("session_start", (_event, ctx) => {
     rt.manager = new TaskManager(ctx.cwd);
+    bindSandboxLifecycle(rt.manager);
     // Restore interrupted task/project records from disk (crash/restart).
     try {
       const resumedTasks = rt.manager.loadFromDisk(ctx.cwd);
@@ -2942,6 +3279,11 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
         );
       }
     } catch { /* recovery is best-effort */ }
+    // Reclaim sandbox containers orphaned by a crash or hard kill. Containers
+    // for still-resumable tasks are kept so /dual resume can continue in them.
+    void gcSandboxContainers(rt.manager.all().map((t) => t.taskId)).then((n) => {
+      if (n > 0) ctx.ui.notify(`Dual-Gate: removed ${n} stale sandbox container(s)`, "info");
+    });
     updateWidget(ctx);
   });
 
@@ -3052,6 +3394,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     { name: "bypass", label: "Bypass next", description: "Next prompt uses normal Pi, then Dual-Gate resumes" },
     { name: "reflex", label: "Reflex Layer", description: "System-1 reflex: on/off/observe/enforce (Gate/Finish/Stuck/Policy)" },
     { name: "triage", label: "Entry Triage", description: "Jev pre-routing: off/observe/enforce (inline vs pipeline)" },
+    { name: "sandbox", label: "Executor Sandbox", description: "Tier-2 isolation: on/off/backend/scope/require (Docker Sandbox / sbx)" },
     { name: "cleanup", label: "Cleanup panes", description: "Close done Dual-Gate worker panes" },
     { name: "help", label: "Help", description: "Show the full command list" },
   ];
@@ -3341,6 +3684,45 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
           }
           break;
         }
+        case "sandbox": {
+          // Tier-2 execution isolation for the Executor pane.
+          const action = (rest[0] ?? "").toLowerCase();
+          const arg = (rest[1] ?? "").toLowerCase();
+          if (action === "on" || action === "off") {
+            rt.config.sandbox.enabled = action === "on";
+            saveConfig({ sandbox: { ...rt.config.sandbox } });
+            ctx.ui.notify(
+              `Dual-Gate sandbox: ${action === "on" ? "ENABLED" : "disabled"}`,
+              action === "on" ? "warning" : "info",
+            );
+          } else if (action === "backend" && (arg === "auto" || arg === "sbx" || arg === "docker")) {
+            rt.config.sandbox.backend = arg;
+            saveConfig({ sandbox: { ...rt.config.sandbox } });
+            ctx.ui.notify(`Dual-Gate sandbox: backend=${arg}`, "info");
+          } else if (action === "scope" && (arg === "task" || arg === "repo")) {
+            rt.config.sandbox.scope = arg;
+            saveConfig({ sandbox: { ...rt.config.sandbox } });
+            ctx.ui.notify(`Dual-Gate sandbox: scope=${arg}`, "info");
+          } else if (action === "require" && (arg === "on" || arg === "off")) {
+            const on = arg === "on";
+            rt.config.sandbox.require = on;
+            saveConfig({ sandbox: { ...rt.config.sandbox } });
+            ctx.ui.notify(`Dual-Gate sandbox: require=${on}${on ? " (fail closed)" : " (fail open → host)"}`, "info");
+          } else if (action === "gate" && (arg === "auto" || arg === "host" || arg === "sandbox")) {
+            rt.config.gate.execution = arg;
+            saveConfig({ gate: { ...rt.config.gate, execution: arg } });
+            const label = arg === "auto"
+              ? "auto (the Executor's container when the task has one, else the host)"
+              : arg === "sandbox"
+                ? "sandbox (fail closed when no container is available)"
+                : "host (gate always runs on the host)";
+            ctx.ui.notify(`Dual-Gate gate execution: ${label}`, "info");
+          } else {
+            const repoPath = rt.activeProject?.repoPath ?? process.cwd();
+            showText(formatSandboxStatus({ config: rt.config.sandbox, repoPath, gateExecution: rt.config.gate.execution }).join("\n"));
+          }
+          break;
+        }
         case "cleanup": {
           await cleanup(ctx, rt);
           break;
@@ -3578,6 +3960,15 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
   }
 
   async function cleanup(ctx: ExtensionCommandContext, rt: DgRuntime): Promise<void> {
+    // Sandbox containers first: they are independent of pane cleanup, and the
+    // pane early-return below must not skip them.
+    const TERMINAL = ["DONE", "FAILED", "CANCELLED", "ESCALATED"];
+    for (const t of rt.manager.all()) {
+      if (TERMINAL.includes(t.state)) await releaseSandboxContainer(t.taskId);
+    }
+    const swept = await gcSandboxContainers(rt.manager.all().filter((t) => !TERMINAL.includes(t.state)).map((t) => t.taskId));
+    if (swept > 0) ctx.ui.notify(`Dual-Gate: removed ${swept} sandbox container(s)`, "info");
+
     const done = rt.manager.all().filter((t) => ["DONE", "FAILED", "CANCELLED", "ESCALATED"].includes(t.state) && t.herdrPanelId);
     const pm = rt.activeProject?.productManager;
     const closePm = !!pm?.paneId && ["DONE", "FAILED", "CANCELLED"].includes(pm.state);

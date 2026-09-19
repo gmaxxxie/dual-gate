@@ -32,14 +32,49 @@ export interface ModelRef {
   name: string;
 }
 
+/** Detected project language, used to pick a sandbox image that has the toolchain. */
+export type ProjectLanguage = "node" | "python" | "go" | "rust" | "unknown";
+
+/** Executor sandbox (Docker Sandbox / sbx). */
+export interface SandboxConfig {
+  enabled: boolean;
+  /** auto = prefer sbx, fall back to a caller-pinned docker container. */
+  backend: "auto" | "sbx" | "docker";
+  /** Explicit path to pi-docker-sandbox's `sandbox/` backend; "" = auto-resolve. */
+  extension_path: string;
+  /** task = one sandbox per task (isolated); repo = per-project warm reuse. */
+  scope: "task" | "repo";
+  keepalive: boolean;
+  /** Image for Dual-Gate-managed docker containers; "" = auto-detect from the project language. */
+  docker_image: string;
+  /** true = fail the spawn when the sandbox is unusable; false = fail open to host. */
+  require: boolean;
+}
+
 export interface DgConfig {
   enabled: boolean;
   controller: { model: string; thinking: ThinkingLevel };
-  executor: { model: string };
+  executor: {
+    model: string;
+    /**
+     * Extra extensions to load in the Executor pane. The pane runs with
+     * `--no-extensions`, so provider extensions are added back explicitly;
+     * `pi-provider-*` packages are discovered automatically.
+     */
+    extra_extensions: string[];
+  };
+  /** Executor sandbox (Docker Sandbox / sbx). OFF by default. */
+  sandbox: SandboxConfig;
   /** Project-only, read-only PM pane. `default` follows the parent Pi model. */
   product_manager: { model: string };
   runtime: { herdr: "required" };
-  gate: { enabled: boolean; max_retries: number; timeoutMs: number };
+  gate: {
+    enabled: boolean;
+    max_retries: number;
+    timeoutMs: number;
+    /** Where gate commands run: auto = the task's sandbox when it has one, else the host. */
+    execution: "auto" | "host" | "sandbox";
+  };
   judge: { max_retries: number };
   loop: { max_iterations: number };
   panel: { direction: "right" | "down"; ratio: number; on_complete: "keep" | "close" };

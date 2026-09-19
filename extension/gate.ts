@@ -8,7 +8,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
-import type { GateStep } from "./types.ts";
+import type { GateStep, ProjectLanguage } from "./types.ts";
 
 export interface GateDiscovery {
   commands: Array<{ name: string; command: string[]; cwd?: string }>;
@@ -19,8 +19,21 @@ export interface GateDiscovery {
 export interface GateResult {
   passed: boolean;
   steps: GateStep[];
+  /** Where the gate actually ran: "host" or a sandbox/container label. */
+  environment?: string;
   error?: string;
 }
+
+/**
+ * Pluggable gate command runner. Defaults to the host; Dual-Gate passes a
+ * sandbox transport so the gate executes in the same environment the Executor
+ * worked in (see `dockerExecArgs` in sandbox.ts).
+ */
+export type GateExec = (
+  cwd: string,
+  argv: string[],
+  opts: { timeoutMs: number },
+) => Promise<{ code: number | null; stdout: string; stderr: string }>;
 
 /** An explicit successful skip, used when configuration disables the gate. */
 export function skippedGateResult(reason: string): GateResult {
@@ -226,6 +239,24 @@ export function discoverGateCommands(repoPath: string): GateDiscovery {
   return { commands, discovered, notes };
 }
 
+/**
+ * Lightweight project-language hint. Used to pick a sandbox image that already
+ * carries the toolchain, so a per-task container is usable without the
+ * Executor re-provisioning it from scratch on every task.
+ */
+export function detectProjectLanguage(repoPath: string): ProjectLanguage {
+  if (fileExists(repoPath, "package.json")) return "node";
+  if (
+    fileExists(repoPath, "pyproject.toml") ||
+    fileExists(repoPath, "pytest.ini") ||
+    fileExists(repoPath, "setup.py") ||
+    fileExists(repoPath, "requirements.txt")
+  ) return "python";
+  if (fileExists(repoPath, "go.mod")) return "go";
+  if (fileExists(repoPath, "Cargo.toml")) return "rust";
+  return "unknown";
+}
+
 // ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
@@ -266,13 +297,15 @@ export function tail(text: string, maxChars = 4000): string {
 export async function runGate(
   repoPath: string,
   discovery: GateDiscovery,
-  opts: { timeoutMs?: number; onStep?: (step: GateStep) => void } = {},
+  opts: { timeoutMs?: number; onStep?: (step: GateStep) => void; exec?: GateExec; environment?: string } = {},
 ): Promise<GateResult> {
   const timeoutMs = opts.timeoutMs ?? 120_000;
+  const environment = opts.environment ?? "host";
+  const run: GateExec = opts.exec ?? ((cwd, argv, o) => runCommand(cwd, argv, o));
   const steps: GateStep[] = [];
   for (const c of discovery.commands) {
     const started = Date.now();
-    const { code, stdout, stderr } = await runCommand(c.cwd ?? repoPath, c.command, { timeoutMs });
+    const { code, stdout, stderr } = await run(c.cwd ?? repoPath, c.command, { timeoutMs });
     const out = tail((stdout || "") + (stderr || ""), 4000);
     const passed = code === 0;
     const step: GateStep = {
@@ -288,22 +321,23 @@ export async function runGate(
     opts.onStep?.(step);
     if (!passed) {
       // Stop at first failing gate step; the executor needs the failure.
-      return { passed: false, steps };
+      return { passed: false, steps, environment };
     }
   }
   // An empty discovery is explicitly a skipped, successful gate: there is no
   // project-authoritative command to run, so retrying cannot make progress.
   const passed = steps.every((s) => s.passed);
-  return { passed, steps };
+  return { passed, steps, environment };
 }
 
 export function formatGateResult(result: GateResult): string {
+  const where = result.environment && result.environment !== "host" ? ` (in ${result.environment})` : "";
   if (result.steps.length === 0) {
-    return "Gate: no validation commands discovered (nothing authoritative to run).";
+    return `Gate: no validation commands discovered (nothing authoritative to run).`;
   }
   const lines = result.steps.map((s) => {
     const status = s.skipped ? "SKIP" : s.passed ? "PASS" : "FAIL";
     return `[${status}] ${s.name} — ${s.command}${s.passed ? "" : ` (exit ${s.exitCode})`}`;
   });
-  return lines.join("\n");
+  return `Gate environment: ${result.environment ?? "host"}${where}\n` + lines.join("\n");
 }

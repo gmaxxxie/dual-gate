@@ -110,6 +110,7 @@ Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual product-m
 | `/dual bypass` | Next user task goes through normal Pi, then Dual-Gate resumes |
 | `/dual reflex` | Reflex Layer (System-1): `on/off`, `observe/enforce` mode, backend, status |
 | `/dual triage [off\|observe\|enforce]` | Entry triage mode (default `observe`); `/dual triage tail` shows the last 5 decisions |
+| `/dual sandbox [on\|off\|status]` | Executor sandbox (Tier-2): `on/off`, `backend <auto\|sbx\|docker>`, `scope <task\|repo>`, `require <on\|off>` |
 | `/dual cleanup` | Close only panes created by Dual-Gate that are DONE/CANCELLED/FAILED (by task ownership) |
 
 ## Configuration (`~/.pi/agent/dual-gate.json`)
@@ -119,9 +120,10 @@ Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual product-m
   "enabled": false,   // off by default; persisted to true after /dual on
   "controller": { "model": "openai-codex/gpt-5.6-sol", "thinking": "medium" },
   "executor": { "model": "new-api/deepseek-v4-flash" },
+  "sandbox": { "enabled": false, "backend": "auto", "extension_path": "", "scope": "task", "keepalive": true, "docker_image": "debian:stable-slim", "require": false },
   "product_manager": { "model": "default" },
   "runtime": { "herdr": "required" },
-  "gate": { "enabled": true, "max_retries": 3, "timeoutMs": 300000 },
+  "gate": { "enabled": true, "max_retries": 3, "timeoutMs": 300000, "execution": "auto" },
   "judge": { "max_retries": 2 },
   "loop": { "max_iterations": 5 },
   "panel": { "direction": "right", "ratio": 0.4, "on_complete": "keep" },
@@ -173,6 +175,106 @@ and cannot speed up a single GPT-5.6 reasoning pass. Its value is **diverting
 ordinary judgments to 0.5s so GPT-5.6 Judge calls (seconds–tens of seconds)
 happen only when the Reflex genuinely cannot decide**. GPT-5.6 remains the
 System-2 authority and is never removed from the loop.
+
+## Executor Sandbox (Tier-2 isolation, optional)
+
+By default the Executor pane's `pi` runs on the host with full user
+privileges: it edits the repo, and the tests it runs execute repository code.
+The optional Executor sandbox routes the Executor's **built-in tools**
+(`bash`, `read`, `write`, `edit`, `grep`, `find`, `ls`) into a disposable
+Docker Sandbox (`sbx`) microVM, while `pi` itself stays on the host with its
+own auth, config, sessions and model keys. The workspace is mounted at its
+host absolute path, so the worktree/merge flow is unchanged.
+
+```
+Executor pane (cwd = task worktree/repo)
+  └─ pi            (host: auth, models, sessions)
+       └─ bash/read/write/edit/grep/find/ls ──► sbx microVM (own docker daemon)
+```
+
+This isolates the **Executor and, by default, the Gate**. The Controller and
+the Judge are unchanged. Two things are worth knowing up front:
+
+- **The Gate runs in the Executor's own container** (`gate.execution: auto`),
+  so an Executor-side pass can no longer fail on sandbox↔host drift — the gate
+  sees the exact environment the work was done in. Every gate result records
+  where it ran (`Gate environment: docker:<container>` or `host`), so the
+  evidence is explicit rather than assumed. `gate.execution: host` restores the
+  old behaviour; `sandbox` fails closed when no container is available.
+- **Isolation is per task by default** (`scope: task`), so Task A's pulled
+  images and containers never leak into Task B, and two parallel milestones
+  in different worktrees never share one sandbox mount.
+
+When the sandbox is ON the Executor pane is split at the **task cwd** instead
+of the usual stable pane cwd — pi-docker-sandbox mounts the pane process's cwd
+into the microVM, and starting in `$HOME` would mount all of it. If that cwd
+cannot hold a pane (see *Known Environment Facts*), Dual-Gate retries from the
+stable cwd with the sandbox **off** rather than failing the task; with
+`sandbox.require: true` it fails instead. With the sandbox OFF the historical
+split behaviour is untouched.
+
+### Requirements
+
+The sandbox needs pi-docker-sandbox's `sandbox/` execution backend plus a
+runtime to route into:
+
+| Backend | Requirement |
+|---|---|
+| `sbx` (preferred) | `sbx` CLI + a host hypervisor (Linux x86_64 with KVM, user in the `kvm` group) + `sbx login` |
+| `docker` | a working `docker` CLI — Dual-Gate creates and owns a per-task container. Pin `SBX_DOCKER_CONTAINER` to use your own instead. No sbx, no KVM. |
+
+> `sbx` is officially supported on **Ubuntu 24.04+ only** (Docker's apt repo has no Debian package, and
+> `sbx login` needs an interactive browser OAuth). On other distributions the docker backend is the
+> practical path.
+
+### Container lifecycle (docker backend)
+
+pi-docker-sandbox's docker backend never manages its target — it is caller-supplied by design. So when
+the sandbox falls back to docker, **Dual-Gate owns the container itself**:
+
+- **One container per task**, named `dg-sbx-<taskId>` and labelled `com.dual-gate.sandbox=true`, with the
+  project mounted at its host absolute path. Parallel milestones in different worktrees therefore never
+  share a mount.
+- **Created before the pane**, started if it already exists (so recovery reuses it). If creation fails the
+  Executor falls back to the host with a warning (`require: true` fails the spawn instead).
+- **Released when the task reaches a terminal state** (DONE/FAILED/CANCELLED/ESCALATED), and by
+  `/dual cleanup`. `/dual cleanup` and session start also sweep orphans left by a crash or hard kill.
+- Only containers carrying Dual-Gate's label are ever touched, so your own containers are never removed.
+- Image is `sandbox.docker_image`; when empty it is derived from the project language
+  (`node:22-slim`, `python:3.12-slim`, `golang:1.23-bookworm`, `rust:1-slim-bookworm`,
+  else `debian:stable-slim`) so the toolchain is present without the Executor
+  re-provisioning it on every task — and so the gate can actually run in it.
+
+Install the backend **in every project where you want the sandbox**
+(recommended). Filtering `extensions` keeps its 19 `docker_*` tools out of the
+Controller's prompt — only the files are needed. Dual-Gate looks for the
+backend in the target repo, so a project without it simply fails open to the
+host with a warning in `/dual sandbox`.
+
+```bash
+pi install -l npm:@stixxert/pi-docker-sandbox
+```
+
+```jsonc
+// .pi/settings.json — files on disk, nothing registered in the Controller
+{ "packages": [ { "source": "npm:@stixxert/pi-docker-sandbox", "extensions": [] } ] }
+```
+
+### Enable
+
+```bash
+/dual sandbox on                       # enable (default: off)
+/dual sandbox                          # status: backend, availability, resolved path, scope
+/dual sandbox backend sbx|docker|auto  # auto = prefer sbx, else a pinned container
+/dual sandbox scope task|repo          # task = isolated per task; repo = warm reuse (shared)
+/dual sandbox require on|off           # off (default) = fail open to host
+/dual sandbox gate auto|host|sandbox   # where the Gate runs (default auto = the Executor's container)
+```
+
+**Fail-open by default.** If the backend is missing or unusable, Dual-Gate
+warns and the Executor runs on the **host**: a task that cannot be sandboxed is
+still worth running. Set `require: true` to fail the spawn instead. The warning
+is deliberately explicit, because "silently unsandboxed" is the dangerous case.
 
 ## When to enable Dual-Gate
 
@@ -299,10 +401,10 @@ Also: DIAGNOSING (iteration threshold → Convergence Diagnosis), WAITING_PERMIS
 
 ## Known Environment Facts (verified on this machine)
 
-- `herdr pane split --cwd <git-repo>` panes get reaped (shell detection failure), so **split always uses the main pane cwd**; the Executor cd's itself via the REPOSITORY path in the prompt.
+- `herdr pane split --cwd <git-repo>` **can** be reaped instantly (SIGHUP), and whether it is depends on **where** the checkout lives, not on whether it is a repo. Measured on the current Herdr build (repeats each): a git checkout under `~/Project` survives; a git checkout under `/tmp`, `/var/tmp`, or a direct child of `$HOME` is reaped within ~1s; a non-git directory survives anywhere. The historical note was therefore right in substance. Dual-Gate splits at the main pane cwd by default (no behaviour change) and only uses the task cwd when the Executor sandbox is enabled, where the workspace mount requires it; if that cwd cannot hold a pane, it retries from the stable cwd with the sandbox **off** rather than failing the task.
 - `agent prompt --wait` can falsely report `agent_prompt_stalled` for fast replies — the message is actually processed; the extension **polls `agent get` until idle/done** instead.
 - `pi -p` (print mode) can SIGTERM under async execFile (needs sync calls); in-extension reasoning goes through `modelRegistry.complete` (in-process), unaffected.
-- Splits on the main pane cwd are stable (5/5 survived); splits on a git repo cwd are reliably reaped (0/5 survived).
+- Splits on the main pane cwd are stable. Repo-cwd splits are location-dependent (see above), which is why the sandbox path has a no-sandbox fallback.
 
 ## Tests
 
@@ -310,6 +412,7 @@ Also: DIAGNOSING (iteration threshold → Convergence Diagnosis), WAITING_PERMIS
 cd /path/to/dual-gate
 node --experimental-strip-types tests/core.test.ts   # core assertions
 node --experimental-strip-types tests/reflex.test.ts # reflex layer (18 tests)
+node --experimental-strip-types tests/sandbox.test.ts # executor sandbox (17 tests)
 ```
 
 Covers: config defaults/normalization/invalid values, task id/title/agent name, state machine transitions, convergence tracking, risk detection, YAML/Execution Report/Judge parsing (converged/implementation_gap/spec_gap/blocked), contract/spec-revision/diagnosis parsing, prompt building (initial/delta-fix/judge), artifact store, gate discovery (node/python/go/no command), gate running (pass/fail), project WBS parsing/validation/stable topological ordering, milestone→contract projection, PM launch policy and plan/feedback/acceptance IPC correlation, project lifecycle/cancellation/acceptance guards.

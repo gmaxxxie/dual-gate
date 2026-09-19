@@ -15,6 +15,8 @@ import {
   normalizeConfig,
   isThinking,
   resolveModelString,
+  resolveExecutorModel,
+  discoverProviderExtensions,
   findAvailableAuthenticatedModel,
   generateTaskId,
   derivePanelTitle,
@@ -184,6 +186,65 @@ test("resolveModelString", () => {
   assert.deepEqual(resolveModelString("opencode/gpt-5.6-sol"), { provider: "opencode", id: "gpt-5.6-sol", name: "opencode/gpt-5.6-sol" });
   assert.deepEqual(resolveModelString("deepseek-v4-flash"), { provider: "", id: "deepseek-v4-flash", name: "deepseek-v4-flash" });
   assert.equal(resolveModelString("  "), null);
+});
+
+test("discoverProviderExtensions finds provider packages only", () => {
+  const root = mkdtempSync(join(tmpdir(), "dg-prov-"));
+  const nm = join(root, "node_modules");
+  const mk = (name: string, manifest: unknown) => {
+    const dir = join(nm, name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify(manifest));
+    return dir;
+  };
+  const provider = mk("pi-provider-newapi", { name: "pi-provider-newapi", pi: { extensions: ["./index.ts"] } });
+  const scoped = mk("@acme/pi-provider-thing", { name: "@acme/pi-provider-thing", pi: { extensions: ["./index.ts"] } });
+  mk("pi-subagents", { name: "pi-subagents", pi: { extensions: ["./index.ts"] } });
+  mk("pi-provider-empty", { name: "pi-provider-empty", pi: { extensions: [] } });
+  mk("plain-pkg", { name: "plain-pkg" });
+
+  const found = discoverProviderExtensions([nm]);
+  assert.ok(found.includes(provider), "pi-provider-* is discovered");
+  assert.ok(found.includes(scoped), "scoped provider packages are discovered");
+  assert.ok(!found.some((p) => p.includes("pi-subagents")), "a non-provider package is skipped");
+  assert.ok(!found.some((p) => p.includes("pi-provider-empty")), "a provider with no extensions is skipped");
+  assert.ok(!found.some((p) => p.includes("plain-pkg")), "an unrelated package is skipped");
+
+  // A missing node_modules directory is not an error.
+  assert.deepEqual(discoverProviderExtensions([join(root, "nope")]), []);
+  // A malformed manifest is skipped rather than thrown.
+  const bad = mk("pi-provider-bad", {});
+  writeFileSync(join(bad, "package.json"), "{ not json");
+  assert.deepEqual(discoverProviderExtensions([nm]).filter((p) => p.includes("pi-provider-bad")), []);
+});
+
+test("executor.extra_extensions normalizes to trimmed strings", () => {
+  assert.deepEqual(DEFAULT_CONFIG.executor.extra_extensions, []);
+  const c = normalizeConfig({ executor: { model: "x", extra_extensions: ["  /a/b  ", "", 42, "/c"] } as never });
+  assert.deepEqual(c.executor.extra_extensions, ["/a/b", "/c"], "blank and non-string entries are dropped");
+  assert.deepEqual(normalizeConfig({ executor: { model: "x" } as never }).executor.extra_extensions, []);
+});
+
+test("resolveExecutorModel follows the main Pi for `default`", () => {
+  const parent = { provider: "new-api", id: "deepseek-v4.1-flash" };
+
+  // The bug this guards: omitting --model made the worker fall back to its OWN
+  // default instead of the main Pi's current model.
+  const dflt = resolveExecutorModel("default", parent);
+  assert.equal(dflt.model, "new-api/deepseek-v4.1-flash", "`default` must resolve to a concrete parent model");
+  assert.equal(dflt.unresolved, false);
+  assert.ok(dflt.label.includes("new-api/deepseek-v4.1-flash"));
+
+  // An explicit model is passed through untouched, even one named "default-ish".
+  const explicit = resolveExecutorModel("openai-codex/gpt-5.6-terra", parent);
+  assert.equal(explicit.model, "openai-codex/gpt-5.6-terra");
+  assert.equal(explicit.label, "openai-codex/gpt-5.6-terra");
+  assert.equal(explicit.unresolved, false);
+
+  // `default` with no known parent must be reported, not silently substituted.
+  const orphan = resolveExecutorModel("default", undefined);
+  assert.equal(orphan.model, "");
+  assert.equal(orphan.unresolved, true, "unknown parent must be surfaced to the caller");
 });
 
 test("strict PM model lookup rejects synthetic, unknown, and unauthenticated models", () => {

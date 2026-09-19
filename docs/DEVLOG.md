@@ -6,6 +6,98 @@
 
 ## 2026-09-19
 
+### 完整 `/dual` 实跑（真实模型，一次收敛）
+
+**目标**：用真实模型跑完整闭环，验证 Tier-1/Tier-2 在真实编排下生效（此前只验证到组件层）。
+
+**环境**：目标仓库 `/home/max/Project/dg-verify-repo`（临时建的小 node 仓库，基线 `npm test` 通过）；controller/judge `openai-codex/gpt-5.6-terra` (high)，executor `default`；后端 `auto → docker`（本机无 sbx）。
+
+**任务**：给 `src/weekend.js` 加 `isWeekend(date)`（周六/周日返回 true），并加 `tests/weekend.test.js` 覆盖一个周末日与一个工作日。
+
+**结果**（75 秒，1 次迭代收敛）：
+- 状态机：`EXECUTING → JUDGING → DONE`，`iteration=1`，`gapCount=0`。
+- **Gate 确实在容器里跑**：`gate.log` 首行 `Gate environment: docker:dg-sbx-task-20260919-a53a`，`[PASS] npm:test`。
+- Judge：`verdict=converged`，`confidence=high`，`gaps=[]`。
+- 产物代码正确（`date.getDay()` 判 0/6），测试覆盖周末与工作日。
+- **宿主机独立复核**：我自己在宿主机跑 `npm test` → `pass 3 / fail 0`，无漂移。
+- **容器自动回收**：任务终态后 `docker ps -a --filter label=com.dual-gate.sandbox=true` 为空。
+- Executor pane 状态栏直接显示 `sbx: docker dg-sbx-task-20260919-a53`，证明沙箱后端在 Executor pane 内生效。
+
+**实跑中发现的两个真实问题**：
+1. **后端必须装在目标项目里**：首次 `/dual sandbox` 在验证仓库显示 `backend path: NOT FOUND`（后端是 project-scoped 装在 dual-gate 仓库），于是会 fail-open 回退宿主机。在目标仓库 `pi install -l` 后才解析成功。已写进 README。
+2. **pane 回收是位置相关的**（见上），已加回退。
+
+**待确认（本次未修，与本轮改动无关）**：`executor.model: "default"` 时，Executor pane 实际跑的是 `openai-codex/gpt-5.5`，而不是主 Pi 当时的 `new-api/deepseek-v4.1-flash`。README 称 `default` 会「跟随主 Pi 模型」，与实际观察不一致，需要单独查。
+
+**清理**：测试后还原了 `~/.pi/agent/dual-gate.json`（备份→恢复），删除了临时验证仓库与 pane，无残留容器。
+
+---
+
+### Tier-1 Gate 沙箱化：Gate 在 Executor 的容器里跑（消除环境漂移）
+
+**背景**：Tier-2 把 Executor 放进沙箱后，Gate 仍在宿主机跑——Executor 侧通过、Gate 侧因环境漂移失败是真实风险（例如容器里没装 node、宿主机装了）。
+
+**决定**：Gate 默认在 **Executor 自己的容器**里执行（`gate.execution: auto`），**复用同一个容器**而不是新建：容器里的工具链正是 Executor 干活时用的，且依赖装在挂载的仓库里（node_modules 落在宿主机），所以 Gate 直接可用。
+
+**设计要点**：
+- `gate.ts` 新增可插拔执行器 `GateExec`；默认仍是宿主机 `execFile`，Dual-Gate 传入 docker 传输层。
+- `GateResult.environment` 记录 Gate 实际在哪跑（`host` / `docker:<container>`），`formatGateResult` 也显示——证据显式化，而不是假定。
+- docker 传输层用 **argv 位置参数**（`docker exec -w <cwd> -e NO_COLOR=1 -e CI=1 <container> <argv...>`），不经 shell，命令不可能被重解释为 shell 语法。
+- 容器镜像留空时按**项目语言自动选择**（node/python/go/rust → 对应 slim 镜像），避免每个任务重装工具链、也保证 Gate 有工具可跑。
+- `gate.execution: host` 恢复旧行为；`sandbox` 则无容器时 fail closed（返回明确失败的 gate，而非静默降级）。
+- 项目最终 Gate 同样沙箱化：为项目建专用容器 `dg-sbx-<projectId>-final`，跑完即删（finally）。
+- 命令：`/dual sandbox gate auto|host|sandbox`；状态里显示 gate 执行位置。
+
+**验证**（真实运行）：
+- 单测 `tests/sandbox.test.ts` 21/21（新增 docker exec argv 形状、语言→镜像映射、显式镜像优先、项目 gate 容器名、语言探测、gate.execution 归一化）。
+- **端到端**：造一个 probe 文件只存在于容器内（宿主机没有），用**真实的 `discoverGateCommands` + `runGate`**：
+  - 宿主机对照组 → gate **失败**（缺 probe）——这正是 Tier-1 要消除的漂移
+  - 沙箱传输 → gate **通过**，`environment = docker:dg-sbx-task-gate-e2e`，输出来自容器内
+  - 失败传播 → `exit 3` 穿过 `docker exec` 后 exitCode 仍为 3
+  - `formatGateResult` 显示环境
+  **ALL CHECKS PASSED**，无残留容器。
+
+---
+
+### Tier-2 Executor 沙箱：Executor 内置工具进 Docker Sandbox
+
+**背景**：Dual-Gate 的核心前提是无人值守自主循环——Executor 自由改仓库、Gate 跑 `npm test`（= 执行仓库任意代码）、最多 5 轮 retry，全部以完整用户权限跑在宿主机上。Gate 是整个闭环的信任锚，却与 Executor 处于同一个可写环境。
+
+**决定**：只隔离 Executor（Tier-2）。Executor pane 的 `pi` 仍留在宿主机（自己的 auth/模型 key），通过 pi-docker-sandbox 的 `sandbox/` 执行后端把内置工具（bash/read/write/edit/grep/find/ls）路由进 sbx microVM。**不采纳**「JEV 作为顶层唯一决策器」的架构：GPT-5.6 仍是 System-2 权威，JEV 保持 System-1 预过滤，否则是交付契约终审上的质量倒退。
+
+**设计要点**：
+- 新增 `extension/sandbox.ts`：纯策略模块（路径解析、可用性预检、命名、env、plan）。Dual-Gate 只拥有策略，不直接调 `sbx`/`docker`。
+- 沙箱命名 `scope: task`（默认）→ `dg-<taskId>`，与「一个任务 = 一个 session」一致，且保证并行里程碑的不同 worktree 不共用挂载；`repo` → 交给扩展派生热复用沙箱。
+- **默认 fail-open**：后端不可用时警告并回退宿主机；`require: true` 才 fail-closed。
+- 沙箱开启时 pane 在**任务 cwd** 切分（挂载要求）；关闭时行为不变。
+- 配置：`sandbox: { enabled, backend, extension_path, scope, keepalive, docker_image, require }`；命令 `/dual sandbox ...`。
+
+**sbx 平台限制（重要发现）**：查 Docker 官方文档与 apt 索引——`sbx` 在 Linux 上**仅官方支持 Ubuntu 24.04+**，`docker-sbx` 包只存在于 ubuntu 仓库，Debian（bookworm/trixie）仓库没有；且需 KVM + 用户在 `kvm` 组 + `sbx login`（交互式 OAuth）。本机为 Debian 13 且 `max` 不在 `kvm` 组，故 sbx 路径不可行。pi-docker-sandbox 的 README 把安装写成 `REPO_ONLY=1 sh` + `apt-get install docker-sbx`（那是 Ubuntu 路径），在 Debian 上必然失败。
+
+**容器自管（docker 后端）**：pi-docker-sandbox 的 docker 后端按设计**从不管理目标容器**（caller-supplied），因此当回退到 docker 时，容器生命周期改由 Dual-Gate 自己持有：
+- 每任务一个容器 `dg-sbx-<taskId>`，标签 `com.dual-gate.sandbox=true` + `...sandbox.task=<taskId>`，仓库按宿主机绝对路径挂载；并行里程碑不同 worktree 绝不共用挂载。
+- 创建 pane **之前**创建（已存在则复用/启动，故恢复能接上）；创建失败 fail-open 回退宿主机（`require: true` 则 fail-closed）。
+- 任务进入终态时释放——在 `TaskManager` 新增**单一钩子** `onTerminal`，`patch()` 与 `transition()` 两条路径都覆盖（绝大多数终态是 `patch` 设的），且只在“进入”终态时触发一次。`/dual cleanup` 与会话启动额外做标签化 GC，清扫崩溃/强杀遗留的孤儿容器；只碰自己标签的容器。
+
+**环境事实修正（重要，推翻了本条初稿的结论）**：初稿写「原记录 repo-cwd pane 被回收已不复现，5/5 存活」——**这是错的**。当时只在 `~/Project` 下测过。用路径矩阵复测后真相是：**回收是位置相关的**。git checkout 在 `~/Project` 下存活；在 `/tmp`、`/var/tmp`、`$HOME` 直接子目录下约 1 秒内被回收（日志显示 `pane.exit status=ExitStatus { code: 1, signal: Some("Hangup") }`）；非 git 目录在任何位置都存活；`/tmp` 本身存活。即旧记录的实质（repo cwd 可能被回收）是对的。
+
+**因此新增回退**：沙箱开启时若任务 cwd 挂不住 pane（3 次重试均失败），不再直接让任务 FAILED，而是退回稳定 cwd 并**关闭沙箱**（fail-open），并警告；`sandbox.require: true` 才失败。关键是不能带着沙箱退回 `$HOME` —— 那会把整个家目录挂进 microVM，所以回退必须同时去掉沙箱。
+
+**验证**（真实运行，非仅单测）：
+- 单测 `tests/sandbox.test.ts` 17/17（路径解析/可用性（含 managed docker）/命名/env/docker 参数/plan/fail-open/fail-closed/配置归一化）；core 70/70、reflex 18/18 无回归。
+- 端到端（docker 后端，因本机无 sbx）：容器内写 `/tmp/dg-sbx-marker.txt`（宿主机不存在）→ 用 **Dual-Gate 完全相同的参数**（`pi -ne --extension <sandbox dir>` + `DOCKER_SANDBOX`/`SBX_BACKEND`/`SBX_DOCKER_CONTAINER`）跑 `bash` 工具 → 输出 `CONTAINER_ONLY_ROUTED`；去掉 `--extension` 的对照组输出为空。证明工具执行确实被路由进沙箱。
+- 容器自管端到端：用**真实的 `dockerRunArgs()`** 建容器 → 校验运行中/标签/任务标签/挂载为宿主机绝对路径/workdir → `docker ps --filter label=...` 能列出（gc 用的查询）→ 对着该容器跑 pi+sandbox 后端输出 `CONTAINER_ONLY_ROUTED` → `docker rm -f` 后确实消失。**ALL CHECKS PASSED**，无残留容器。
+- 期间发现并确认一个非 bug 的细节：`docker ps -aq` 返回**短** ID 而 `docker run -d` 返回**完整** ID；`gcSandboxContainers` 用短 ID 去 inspect/rm 是可行的，是测试断言写错了。
+- `herdr pane split --env` 传递验证：pane 内 `ENVPROBE=dg-e2e/docker/1`，证明 env 能到达 `agent start` 启动的 pi。
+- 真实路径解析：项目内安装被正确解析到 `.pi/npm/node_modules/@stixxert/pi-docker-sandbox/sandbox`。
+
+**遗留**：
+- 本机 sbx 不可用（Ubuntu-only + 不在 kvm 组），故走 docker 后端（容器级隔离，共享内核，弱于 microVM）。
+- Gate 已由 Tier-1 沙箱化（见上一条），沙箱↔宿主机漂移风险已消除。
+- 未做完整 `/dual` 编排实跑（需真实模型 token）；已验证到 pane env 传递 + 工具路由 + 容器生命周期三个层面。
+
+---
+
 ### Reflex Layer v0.2c：真实环境端到端验证 + 安装同步 + 语义修正
 
 **同步**：`install.sh` 修复——原来只复制顶层 `*.ts`，漏了 `reflex/` 子目录；已改为递归复制，并重新执行安装（`~/.pi/agent/extensions/dual-gate/reflex/*.ts` 全部就位，syntax + load 通过）。

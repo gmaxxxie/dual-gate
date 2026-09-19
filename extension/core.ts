@@ -64,11 +64,14 @@ export function createArtifactStore(taskDir: string): ArtifactStore {
 export const DEFAULT_CONFIG: DgConfig = {
   enabled: false,
   controller: { model: "openai-codex/gpt-5.6-sol", thinking: "medium" },
-  executor: { model: "new-api/deepseek-v4-flash" },
+  executor: { model: "new-api/deepseek-v4-flash", extra_extensions: [] },
+  // Executor sandbox: OFF by default. Tier-2 isolation — the Executor's tools
+  // run inside an sbx microVM while pi itself stays on the host.
+  sandbox: { enabled: false, backend: "auto", extension_path: "", scope: "task", keepalive: true, docker_image: "", require: false },
   // Project mode only. `default` deliberately follows the parent Pi model.
   product_manager: { model: "default" },
   runtime: { herdr: "required" },
-  gate: { enabled: true, max_retries: 3, timeoutMs: 300_000 },
+  gate: { enabled: true, max_retries: 3, timeoutMs: 300_000, execution: "auto" },
   judge: { max_retries: 2 },
   loop: { max_iterations: 5 },
   panel: { direction: "right", ratio: 0.4, on_complete: "keep" },
@@ -90,6 +93,19 @@ export function normalizeConfig(raw: Partial<DgConfig> | null | undefined): DgCo
   }
   if (r.executor && typeof r.executor === "object") {
     if (typeof r.executor.model === "string" && r.executor.model.trim()) c.executor.model = r.executor.model.trim();
+    if (Array.isArray(r.executor.extra_extensions)) {
+      c.executor.extra_extensions = r.executor.extra_extensions.filter((p: unknown): p is string => typeof p === "string" && !!p.trim()).map((p: string) => p.trim());
+    }
+  }
+  if (r.sandbox && typeof r.sandbox === "object") {
+    const sb = r.sandbox as Record<string, unknown>;
+    if (typeof sb.enabled === "boolean") c.sandbox.enabled = sb.enabled;
+    if (sb.backend === "auto" || sb.backend === "sbx" || sb.backend === "docker") c.sandbox.backend = sb.backend;
+    if (typeof sb.extension_path === "string") c.sandbox.extension_path = sb.extension_path.trim();
+    if (sb.scope === "task" || sb.scope === "repo") c.sandbox.scope = sb.scope;
+    if (typeof sb.keepalive === "boolean") c.sandbox.keepalive = sb.keepalive;
+    if (typeof sb.docker_image === "string" && sb.docker_image.trim()) c.sandbox.docker_image = sb.docker_image.trim();
+    if (typeof sb.require === "boolean") c.sandbox.require = sb.require;
   }
   // Optional for backwards-compatible persisted configuration.
   if (r.product_manager && typeof r.product_manager === "object") {
@@ -99,6 +115,7 @@ export function normalizeConfig(raw: Partial<DgConfig> | null | undefined): DgCo
     if (typeof r.gate.enabled === "boolean") c.gate.enabled = r.gate.enabled;
     if (Number.isFinite(r.gate.max_retries) && r.gate.max_retries >= 0) c.gate.max_retries = Math.floor(r.gate.max_retries);
     if (Number.isFinite(r.gate.timeoutMs) && r.gate.timeoutMs > 0) c.gate.timeoutMs = r.gate.timeoutMs;
+    if (r.gate.execution === "auto" || r.gate.execution === "host" || r.gate.execution === "sandbox") c.gate.execution = r.gate.execution;
   }
   if (r.judge && typeof r.judge === "object") {
     if (Number.isFinite(r.judge.max_retries) && r.judge.max_retries >= 0) c.judge.max_retries = Math.floor(r.judge.max_retries);
@@ -140,6 +157,91 @@ export function normalizeConfig(raw: Partial<DgConfig> | null | undefined): DgCo
 
 export function isThinking(v: unknown): v is ThinkingLevel {
   return typeof v === "string" && ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(v);
+}
+
+/**
+ * Resolve the configured Executor model to a concrete `provider/id`.
+ *
+ * `default` means "follow the main Pi". A Herdr child inherits the terminal
+ * environment, not Pi's transient `--model` selection, so omitting `--model`
+ * would make the worker fall back to its OWN default instead — the model must
+ * be resolved explicitly and passed through.
+ *
+ * `unresolved` is reported (rather than silently substituting) when `default`
+ * was requested but the parent model is unknown.
+ */
+export function resolveExecutorModel(
+  configured: string,
+  parent: { provider: string; id: string } | undefined,
+): { model: string; label: string; unresolved: boolean } {
+  if (configured !== "default") return { model: configured, label: configured, unresolved: false };
+  const model = parent ? `${parent.provider}/${parent.id}` : "";
+  return model
+    ? { model, label: `${model}（跟随主 Pi）`, unresolved: false }
+    : { model: "", label: "default（无法解析主 Pi 模型）", unresolved: true };
+}
+
+/**
+ * Installed extension packages that provide a model provider.
+ *
+ * The Executor pane runs with `--no-extensions` so that a worker Dual-Gate can
+ * never recursively intercept its own prompt. That also hides provider
+ * extensions, so a model from an extension-provided provider (e.g. `new-api/*`
+ * from pi-provider-newapi) cannot resolve in the worker. Dual-Gate passes these
+ * packages through explicitly, so `executor.model: "default"` can genuinely
+ * follow the main Pi instead of silently falling back to a built-in model.
+ *
+ * Detection is by package name — the ecosystem convention is
+ * `pi-provider-<name>`. `executor.extra_extensions` covers anything else.
+ */
+export function discoverProviderExtensions(
+  nodeModulesDirs: string[],
+  io: {
+    exists?: (p: string) => boolean;
+    readdir?: (p: string) => string[];
+    readFile?: (p: string) => string;
+  } = {},
+): string[] {
+  const exists = io.exists ?? existsSync;
+  const readdir = io.readdir ?? ((p: string) => readdirSync(p));
+  const readFile = io.readFile ?? ((p: string) => readFileSync(p, "utf8"));
+  const found = new Map<string, string>();
+
+  for (const dir of nodeModulesDirs) {
+    let entries: string[];
+    try {
+      entries = readdir(dir);
+    } catch {
+      continue; // not installed here
+    }
+    // npm scopes: descend one level so @scope/pi-provider-x is reachable.
+    const packages: string[] = [];
+    for (const entry of entries) {
+      if (entry.startsWith("@")) {
+        try {
+          for (const inner of readdir(join(dir, entry))) packages.push(join(dir, entry, inner));
+        } catch { /* unreadable scope */ }
+      } else {
+        packages.push(join(dir, entry));
+      }
+    }
+    for (const pkgDir of packages) {
+      const manifestPath = join(pkgDir, "package.json");
+      if (!exists(manifestPath)) continue;
+      let manifest: { name?: unknown; pi?: { extensions?: unknown } };
+      try {
+        manifest = JSON.parse(readFile(manifestPath)) as typeof manifest;
+      } catch {
+        continue;
+      }
+      const name = typeof manifest.name === "string" ? manifest.name : "";
+      if (!/provider/i.test(name)) continue;
+      const exts = manifest.pi?.extensions;
+      if (!Array.isArray(exts) || exts.length === 0) continue;
+      if (!found.has(name)) found.set(name, pkgDir);
+    }
+  }
+  return [...found.values()];
 }
 
 export function resolveModelString(spec: string): ModelRef | null {
@@ -287,11 +389,21 @@ export function assertTransition(from: TaskState, to: TaskState): void {
 // Task manager
 // ---------------------------------------------------------------------------
 
+/** A task in one of these states is finished and will not be driven further. */
+const TERMINAL_STATES: TaskState[] = ["DONE", "FAILED", "CANCELLED", "ESCALATED"];
+
 export class TaskManager {
   private tasks = new Map<string, TaskRecord>();
   private activeTaskId: string | null = null;
   private bypassNext = false;
   private cwd: string;
+
+  /**
+   * Fired once when a task enters a terminal state. Both patch() and
+   * transition() can move a task there, so the hook lives in both. Used to
+   * release the task's sandbox container.
+   */
+  onTerminal: ((taskId: string, state: TaskState) => void) | null = null;
 
   constructor(cwd: string) { this.cwd = cwd; }
 
@@ -345,7 +457,7 @@ export class TaskManager {
   active(): TaskRecord | null {
     if (!this.activeTaskId) return null;
     const t = this.tasks.get(this.activeTaskId);
-    return t && !["DONE", "FAILED", "CANCELLED", "ESCALATED"].includes(t.state) ? t : null;
+    return t && !TERMINAL_STATES.includes(t.state) ? t : null;
   }
 
   all(): TaskRecord[] {
@@ -356,18 +468,35 @@ export class TaskManager {
     const t = this.tasks.get(taskId);
     if (!t) throw new Error(`Unknown task: ${taskId}`);
     assertTransition(t.state, to);
+    const prev = t.state;
     t.state = to;
     t.updatedAt = new Date().toISOString();
     if (to === "DONE") t.completedAt = t.updatedAt;
     if (to === "CANCELLED") { t.cancelledAt = t.updatedAt; if (this.activeTaskId === taskId) this.activeTaskId = null; }
     if (to === "FAILED" || to === "ESCALATED") { if (this.activeTaskId === taskId) this.activeTaskId = null; }
+    this.fireTerminalIfNeeded(prev, t);
     return t;
+  }
+
+  /**
+   * Fire the terminal hook exactly once per task: only on the transition INTO
+   * a terminal state, never on later patches that merely refine it.
+   */
+  private fireTerminalIfNeeded(prev: TaskState, t: TaskRecord): void {
+    if (!TERMINAL_STATES.includes(t.state) || TERMINAL_STATES.includes(prev)) return;
+    try {
+      this.onTerminal?.(t.taskId, t.state);
+    } catch {
+      /* cleanup must never break the orchestration loop */
+    }
   }
 
   patch(taskId: string, patch: Partial<TaskRecord>): TaskRecord {
     const t = this.tasks.get(taskId);
     if (!t) throw new Error(`Unknown task: ${taskId}`);
+    const prev = t.state;
     Object.assign(t, patch, { updatedAt: new Date().toISOString() });
+    this.fireTerminalIfNeeded(prev, t);
     return t;
   }
 
