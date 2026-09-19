@@ -76,6 +76,7 @@ export const DEFAULT_CONFIG: DgConfig = {
   context: { send_full_executor_history_to_judge: false },
   ui: { show_widget: true },
   reflex: { enabled: false, mode: "observe", backend: "hybrid", jev_deadline_ms: 2000 },
+  triage: { mode: "observe", gate: 0.5, excerpt_chars: 2000, timeout_ms: 8000, interactive_only: true },
 };
 
 export function normalizeConfig(raw: Partial<DgConfig> | null | undefined): DgConfig {
@@ -125,6 +126,14 @@ export function normalizeConfig(raw: Partial<DgConfig> | null | undefined): DgCo
     if (rf.mode === "observe" || rf.mode === "enforce") c.reflex.mode = rf.mode;
     if (rf.backend === "rule" || rf.backend === "jev" || rf.backend === "hybrid") c.reflex.backend = rf.backend;
     if (typeof rf.jev_deadline_ms === "number" && Number.isFinite(rf.jev_deadline_ms) && rf.jev_deadline_ms > 0) c.reflex.jev_deadline_ms = Math.floor(rf.jev_deadline_ms);
+  }
+  if (r.triage && typeof r.triage === "object") {
+    const t = r.triage as Record<string, unknown>;
+    if (t.mode === "off" || t.mode === "observe" || t.mode === "enforce") c.triage.mode = t.mode;
+    if (typeof t.gate === "number" && Number.isFinite(t.gate) && t.gate >= 0 && t.gate <= 1) c.triage.gate = t.gate;
+    if (typeof t.excerpt_chars === "number" && Number.isFinite(t.excerpt_chars) && t.excerpt_chars > 0) c.triage.excerpt_chars = Math.floor(t.excerpt_chars);
+    if (typeof t.timeout_ms === "number" && Number.isFinite(t.timeout_ms) && t.timeout_ms > 0) c.triage.timeout_ms = Math.floor(t.timeout_ms);
+    if (typeof t.interactive_only === "boolean") c.triage.interactive_only = t.interactive_only;
   }
   return c;
 }

@@ -90,6 +90,7 @@ import type { ProjectPlan, ProjectRecord, ProjectMilestoneContext, ProductManage
 import { discoverGateCommands, runGate, formatGateResult, skippedGateResult, type GateResult } from "./gate.ts";
 import { runReflexLayer, makeJevClient, formatReflexResult, type JevClient, type ReflexRunInput, type ReflexResult } from "./reflex/index.ts";
 import { JevBackend } from "./reflex/backend.ts";
+import { runTriage, logTriage, TRIAGE_LOG_FILE, type TriageDecision } from "./triage.ts";
 import { normalizeReflexPolicy, type ReflexPolicy, type IterationState, type TurnSignal, type LoopAction } from "./reflex/types.ts";
 import { pushWindow } from "./reflex/progress.ts";
 
@@ -2949,6 +2950,14 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     const config = rt.config;
     if (!config.enabled) return;
     if (!event || typeof event !== "object" || typeof (event as any).text !== "string") return;
+    // Never intercept programmatic traffic: extension-injected messages
+    // (sendUserMessage from patrol/autowriteo/etc.) and RPC-driven sessions
+    // must reach normal Pi. Dual-Gate owns interactive typing only.
+    const src = (event as any).source;
+    if (src === "extension" || src === "rpc") return;
+    // With triage.interactive_only (default), Dual-Gate only owns interactive
+    // TUI typing — `pi -p` scripts, JSON mode and nested pi instances stay out.
+    if (config.triage.interactive_only && ctx.mode !== "tui") return;
     const text = (event as any).text.trim();
     if (!text || text.startsWith("/")) return;
 
@@ -2975,6 +2984,44 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     if ((globalThis as any).__dg_handling_input) return { action: "handled" };
     (globalThis as any).__dg_handling_input = true;
     try {
+      // ---- Entry triage (Jev): inline vs pipeline BEFORE orchestration ----
+      const triage = config.triage;
+      if (triage.mode !== "off") {
+        let decision: TriageDecision | null = null;
+        let triageError: string | null = null;
+        try {
+          decision = await runTriage(text, triage);
+        } catch (err) {
+          triageError = String(err).slice(0, 160);
+        }
+        logTriage({
+          text: text.slice(0, 160),
+          mode: triage.mode,
+          action: decision ? (triage.mode === "enforce" ? "route" : "observe") : "error",
+          lane: decision?.lane,
+          confidence: decision?.confidence,
+          hold: decision?.hold,
+          latencyMs: decision?.latencyMs,
+          error: triageError ?? undefined,
+        });
+        if (decision && ctx.hasUI) {
+          ctx.ui.setStatus(
+            "dual-gate",
+            `triage: ${decision.lane}${decision.hold ? " (hold)" : ""} ${Math.round(decision.confidence * 100)}% · ${decision.latencyMs}ms`,
+          );
+        }
+        if (triage.mode === "enforce" && decision && !decision.hold && decision.lane === "inline") {
+          // Confident chat/quick-edit → normal Pi handles it; no pipeline.
+          return;
+        }
+        if (decision?.lane === "project" && ctx.hasUI) {
+          ctx.ui.notify(
+            "Dual-Gate triage: this looks like a multi-milestone program — consider /dual project <request>",
+            "info",
+          );
+        }
+        // pipeline / project / hold / observe / error → fall through (fail-closed)
+      }
       const task = rt.manager.begin(text, {
         controller: resolveModelString(config.controller.model) ?? { provider: "", id: config.controller.model, name: config.controller.model },
         executor: resolveModelString(config.executor.model) ?? { provider: "", id: config.executor.model, name: config.executor.model },
@@ -3004,6 +3051,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
     { name: "resume", label: "Resume task", description: "Resume with optional new requirement" },
     { name: "bypass", label: "Bypass next", description: "Next prompt uses normal Pi, then Dual-Gate resumes" },
     { name: "reflex", label: "Reflex Layer", description: "System-1 reflex: on/off/observe/enforce (Gate/Finish/Stuck/Policy)" },
+    { name: "triage", label: "Entry Triage", description: "Jev pre-routing: off/observe/enforce (inline vs pipeline)" },
     { name: "cleanup", label: "Cleanup panes", description: "Close done Dual-Gate worker panes" },
     { name: "help", label: "Help", description: "Show the full command list" },
   ];
@@ -3254,6 +3302,45 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
           }
           break;
         }
+        case "triage": {
+          // Entry triage (Jev): decide inline vs pipeline before orchestration.
+          const action = (rest[0] ?? "").toLowerCase();
+          if (action === "off" || action === "observe" || action === "enforce") {
+            rt.config.triage.mode = action;
+            saveConfig({ triage: { ...rt.config.triage, mode: action } });
+            const label =
+              action === "off"
+                ? "off (every prompt enters the pipeline)"
+                : action === "observe"
+                  ? "observe (decide + log, no behavior change)"
+                  : "enforce (confident inline stays on normal Pi)";
+            ctx.ui.notify(`Dual-Gate triage: ${label}`, action === "enforce" ? "warning" : "info");
+          } else if (action === "tail") {
+            try {
+              const lines = readFileSync(TRIAGE_LOG_FILE, "utf8").trim().split("\n").slice(-5).join("\n");
+              showText(lines || "triage log is empty");
+            } catch {
+              showText("no triage decisions logged yet");
+            }
+          } else {
+            const t = rt.config.triage;
+            showText(
+              [
+                "Dual-Gate Entry Triage (Jev pre-routing)",
+                `  mode:          ${t.mode}`,
+                `  gate:          ${t.gate} (uncertain → hold at pipeline)`,
+                `  excerpt_chars: ${t.excerpt_chars}`,
+                `  timeout_ms:    ${t.timeout_ms}`,
+                `  interactive_only: ${t.interactive_only}${t.interactive_only ? " (only TUI typing is intercepted)" : ""}`,
+                `  log:           ${TRIAGE_LOG_FILE}`,
+                "",
+                "  /dual triage off|observe|enforce   switch mode",
+                "  /dual triage tail                  last 5 decisions",
+              ].join("\n"),
+            );
+          }
+          break;
+        }
         case "cleanup": {
           await cleanup(ctx, rt);
           break;
@@ -3276,6 +3363,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
               "  /dual pause                pause active task (Executor kept alive)",
               "  /dual resume [需求说明]    resume; optional new requirement triggers re-analysis",
               "  /dual bypass               next prompt runs on normal Pi",
+              "  /dual triage [mode]        entry triage: off/observe/enforce (inline vs pipeline)",
               "  /dual cleanup              close done worker panels",
             ].join("\n"),
           );
@@ -3301,6 +3389,7 @@ export default function dualGateExtension(pi: ExtensionAPI): void {
       const pmRaw = config.product_manager.model;
       const pm = pmRaw === "default" ? null : resolveModelString(pmRaw);
       lines.push(`Product PM   ${pm ? pm.id : "default（跟随主 Pi）"} · project-only read-only pane`);
+      lines.push(`Triage       ${config.triage.mode} (gate ${config.triage.gate}) · reflex ${config.reflex.enabled ? config.reflex.mode : "off"}`);
       lines.push("Herdr        " + (herdrOk ? "Ready" : "NOT DETECTED"));
       lines.push(`Config       ${CONFIG_PATH} (跨 session/项目持久化)`);
       if (rt.activeProject) {

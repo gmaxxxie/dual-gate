@@ -67,6 +67,7 @@ import {
   buildRecoveryPrompt,
 } from "../extension/core.ts";
 import { discoverGateCommands, runGate, formatGateResult, skippedGateResult } from "../extension/gate.ts";
+import { decideLane, type TriageConfig } from "../extension/triage.ts";
 
 let passed = 0;
 let failed = 0;
@@ -128,6 +129,49 @@ test("config rejects invalid values", () => {
   assert.equal(c.gate.max_retries, 3);
   assert.equal(c.controller.thinking, "medium");
   assert.equal(c.loop.max_iterations, 5);
+});
+
+test("triage config defaults and normalization", () => {
+  const d = normalizeConfig(null).triage;
+  assert.equal(d.mode, "observe"); // decide + log, no behavior change
+  assert.equal(d.gate, 0.5);
+  assert.equal(d.excerpt_chars, 2000);
+  assert.equal(d.timeout_ms, 8000);
+  assert.equal(d.interactive_only, true); // only TUI typing is intercepted
+
+  const c = normalizeConfig({ triage: { mode: "enforce", gate: 0.7, interactive_only: false } } as any).triage;
+  assert.equal(c.mode, "enforce");
+  assert.equal(c.gate, 0.7);
+  assert.equal(c.interactive_only, false);
+  assert.equal(c.excerpt_chars, 2000); // untouched default preserved
+
+  const bad = normalizeConfig({ triage: { mode: "bogus", gate: 5, excerpt_chars: -1, timeout_ms: 0 } } as any).triage;
+  assert.equal(bad.mode, "observe");
+  assert.equal(bad.gate, 0.5);
+  assert.equal(bad.excerpt_chars, 2000);
+  assert.equal(bad.timeout_ms, 8000);
+});
+
+test("triage lane gate holds uncertain lanes at pipeline (fail-closed)", () => {
+  const cfg: TriageConfig = { mode: "enforce", gate: 0.5, excerpt_chars: 2000, timeout_ms: 8000, interactive_only: true };
+  const choice = (c: string, conf: number) => ({ lane: { type: "choice" as const, choice: c, confidence: conf, probabilities: {} } });
+
+  const inline = decideLane(choice("inline", 0.9), 10, cfg);
+  assert.equal(inline.lane, "inline");
+  assert.equal(inline.hold, false);
+
+  // Below the gate → hold at pipeline (never a quality regression).
+  const held = decideLane(choice("inline", 0.3), 10, cfg);
+  assert.equal(held.lane, "pipeline");
+  assert.equal(held.hold, true);
+
+  const project = decideLane(choice("project", 0.8), 10, cfg);
+  assert.equal(project.lane, "project");
+  assert.equal(project.hold, false);
+
+  // Unknown/empty answers must not become inline.
+  assert.equal(decideLane(choice("weird", 0.99), 10, cfg).lane, "pipeline");
+  assert.equal(decideLane({}, 5, cfg).lane, "pipeline");
 });
 
 test("isThinking", () => {

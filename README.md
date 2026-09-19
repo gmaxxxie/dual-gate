@@ -109,6 +109,7 @@ Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual product-m
 | `/dual cancel` | Cancel current task: stop orchestration, keep the pane (renamed `· CANCELLED`), don't delete code or reset git |
 | `/dual bypass` | Next user task goes through normal Pi, then Dual-Gate resumes |
 | `/dual reflex` | Reflex Layer (System-1): `on/off`, `observe/enforce` mode, backend, status |
+| `/dual triage [off\|observe\|enforce]` | Entry triage mode (default `observe`); `/dual triage tail` shows the last 5 decisions |
 | `/dual cleanup` | Close only panes created by Dual-Gate that are DONE/CANCELLED/FAILED (by task ownership) |
 
 ## Configuration (`~/.pi/agent/dual-gate.json`)
@@ -127,7 +128,8 @@ Switch anytime: `/dual controller [id]`, `/dual executor [id]`, `/dual product-m
   "worktree": { "mode": "auto" },
   "context": { "send_full_executor_history_to_judge": false },
   "ui": { "show_widget": true },
-  "reflex": { "enabled": false, "mode": "observe", "backend": "hybrid", "jev_deadline_ms": 2000 }
+  "reflex": { "enabled": false, "mode": "observe", "backend": "hybrid", "jev_deadline_ms": 2000 },
+  "triage": { "mode": "observe", "gate": 0.5, "excerpt_chars": 2000, "timeout_ms": 8000, "interactive_only": true }
 }
 ```
 
@@ -183,6 +185,39 @@ Use this extension for **delivery work that needs an explicit acceptance contrac
 | Project / product delivery | `/dual on`, then `/dual project <request>` | The request needs product planning, WBS/milestones, dependencies, staged acceptance, and progress feedback. This is the three-pane mode. |
 
 Do not use project mode for trivial edits, independent chores, or work that cannot justify milestone planning and an additional model session. Use ordinary task mode first when a project can be safely reduced to one acceptance contract.
+
+## Entry triage (Jev pre-routing)
+
+Without triage, after `/dual on` **every non-command input** enters the full pipeline (pane + Executor + Gate + Judge) — even a one-line chat costs that. Entry triage adds one Jev classification (~0.5–1.2s, ~$0.00002) before orchestration, reusing the `JevBackend` the Reflex Layer already ships:
+
+```
+user input → Jev triage
+  ├─ inline    chat / Q&A / trivial one-liner → normal Pi handles it (no pipeline)
+  ├─ pipeline  real implementation task → existing orchestrate()
+  └─ project   multi-milestone program → pipeline + hint "consider /dual project"
+```
+
+| Mode | Behavior |
+|---|---|
+| `off` | Never calls Jev; keeps the legacy "everything enters the pipeline" behavior |
+| `observe` (default) | Decide + log, **no behavior change** (still pipelines) — for calibration |
+| `enforce` | A confident `inline` returns to normal Pi; everything else pipelines as before |
+
+- **Confidence gate**: below `gate` (default 0.5) the lane holds at pipeline. Misrouting a real task to inline costs quality; over-routing only costs tokens — so uncertainty leans to the heavy path.
+- **Fail-closed**: a Jev error/timeout/malformed answer keeps the legacy pipeline path. Input is never dropped.
+- **Interception surface**: `interactive_only: true` (default) intercepts interactive TUI typing only. `pi -p` scripts, JSON/RPC/SDK automation, and extension-injected messages (patrol / autowriteo / nested `pi` instances in Herdr panes) are never intercepted. This is the precondition for enabling Dual-Gate by default.
+- **Decision log**: `~/.pi/agent/dual-gate-triage.jsonl` (lane / confidence / hold / latency).
+- **`project` only hints**: project mode still requires your explicit `/dual project` + WBS approval (human-in-the-loop unchanged).
+
+### Can `enabled` default to true?
+
+In three steps, not one:
+
+1. **Now**: keep `triage.mode = observe` and use `/dual on` normally for a few days to collect data.
+2. **After calibration**: read `dual-gate-triage.jsonl` — is the inline verdict stable, and did it ever put a real task inline? Switch to `enforce` once the misroute rate is acceptable (target <5%).
+3. **After enforce is stable**: only then consider `enabled: true` in `~/.pi/agent/dual-gate.json` (changing `DEFAULT_CONFIG` only affects fresh installs).
+
+Three things must hold before defaulting on: `interactive_only` is true (otherwise scripts and nested instances get hijacked), `triage.mode` is `enforce` (otherwise every sentence pipelines), and you accept that input during an active task is still consumed as a new requirement (by design, but it becomes the default experience).
 
 ## Project mode (three panes)
 

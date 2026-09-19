@@ -53,6 +53,14 @@ export interface DgConfig {
     backend: "rule" | "jev" | "hybrid";
     jev_deadline_ms: number;
   };
+  /** Entry triage (Jev): inline vs pipeline BEFORE orchestration. observe first. */
+  triage: {
+    mode: "off" | "observe" | "enforce";
+    gate: number;
+    excerpt_chars: number;
+    timeout_ms: number;
+    interactive_only: boolean;
+  };
 }
 
 export interface AcceptanceContract {
